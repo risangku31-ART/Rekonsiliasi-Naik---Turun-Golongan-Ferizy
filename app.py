@@ -1,55 +1,129 @@
 # app.py
-# Streamlit Rekonsiliasi Naik/Turun Golongan berdasarkan Nomor Invoice
+# Streamlit Rekonsiliasi Naik/Turun Golongan (Multi-file, Dependency Helper)
 
 from __future__ import annotations
 
 import io
 import re
-from typing import Iterable, Optional, Tuple
+import sys
+import subprocess
+from typing import Iterable, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 
+# ---------- Dependency helper ----------
+def check_missing_deps() -> List[str]:
+    """Return missing Python packages needed for Excel IO."""
+    missing = []
+    try:
+        import openpyxl  # noqa: F401
+    except Exception:
+        missing.append("openpyxl")
+    try:
+        import xlsxwriter  # noqa: F401
+    except Exception:
+        missing.append("xlsxwriter")
+    try:
+        import xlrd  # noqa: F401
+    except Exception:
+        # optional (xls); include for completeness
+        missing.append("xlrd")
+    return missing
+
+
+def requirements_txt() -> str:
+    """Canonical requirements for this app."""
+    return "\n".join(
+        [
+            "streamlit>=1.33",
+            "pandas>=2.0",
+            "openpyxl>=3.1.2",
+            "xlsxwriter>=3.1",
+            "xlrd>=2.0.1",
+            "",
+        ]
+    )
+
+
+def try_install(pkgs: List[str]) -> List[Tuple[str, bool, str]]:
+    """Attempt pip install at runtime. Not guaranteed in all environments."""
+    results = []
+    for pkg in pkgs:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+            results.append((pkg, True, "installed"))
+        except Exception as e:
+            results.append((pkg, False, str(e)))
+    return results
+
+
 # ---------- Util ----------
 @st.cache_data(show_spinner=False)
 def load_dataframe(file) -> pd.DataFrame:
-    """Load CSV/XLSX into DataFrame. Fallback to CSV sniffing."""
+    """Load single CSV/XLS/XLSX into DataFrame (dtype=str)."""
     if file is None:
         return pd.DataFrame()
     name = file.name.lower()
     try:
+        file.seek(0)
         if name.endswith(".csv"):
             return pd.read_csv(file, dtype=str, encoding_errors="ignore")
-        if name.endswith(".xlsx") or name.endswith(".xls"):
-            # engine picked automatically; if missing, except will be caught
+        if name.endswith(".xlsx"):
+            # openpyxl is required; raise informative error if missing
+            try:
+                import openpyxl  # noqa: F401
+            except Exception as e:
+                raise ImportError(
+                    "File Excel .xlsx membutuhkan paket 'openpyxl'. "
+                    "Tambahkan ke requirements.txt atau instal dengan pip."
+                ) from e
+            return pd.read_excel(file, dtype=str, engine="openpyxl")
+        if name.endswith(".xls"):
+            # xlrd (>=2.0) mendukung .xls? Umumnya perlu 'xlrd<2' untuk xls lama.
+            # Tetap biarkan pandas memilih engine dan tangkap error jika perlu.
             return pd.read_excel(file, dtype=str)
-        # default try CSV
+        # default: coba CSV
         file.seek(0)
         return pd.read_csv(file, dtype=str, encoding_errors="ignore")
+    except ImportError as e:
+        # Pesan yang spesifik dan ramah
+        st.error(f"Gagal membaca file `{file.name}`: {e}")
+        return pd.DataFrame()
     except Exception as e:
         st.error(f"Gagal membaca file `{file.name}`: {e}")
         return pd.DataFrame()
 
 
-def guess_column(
-    columns: Iterable[str], candidates: Iterable[str]
-) -> Optional[str]:
-    """Pick best-matching column name by fuzzy/alias."""
+def load_many(files: Optional[List]) -> pd.DataFrame:
+    """Concatenate many uploaded files into one DataFrame; add 'Sumber File'."""
+    if not files:
+        return pd.DataFrame()
+    frames: List[pd.DataFrame] = []
+    for f in files:
+        df = load_dataframe(f)
+        if not df.empty:
+            temp = df.copy()
+            temp["Sumber File"] = f.name
+            frames.append(temp)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def guess_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
     cols = list(columns)
     norm = {c: normalize_colname(c) for c in cols}
     cand_norm = [normalize_colname(x) for x in candidates]
-    # exact normalized match
     for cn in cand_norm:
         for orig, nn in norm.items():
             if nn == cn:
                 return orig
-    # contains check
     for orig, nn in norm.items():
         if any(cn in nn for cn in cand_norm):
             return orig
-    # prefix/suffix heuristic
     for orig, nn in norm.items():
         if any(nn.startswith(cn) or nn.endswith(cn) for cn in cand_norm):
             return orig
@@ -60,7 +134,6 @@ def normalize_colname(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"[^a-z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # Indonesian aliases
     s = (
         s.replace("no ", "nomor ")
         .replace("no", "nomor")
@@ -73,20 +146,12 @@ def normalize_colname(s: str) -> str:
 
 
 def coerce_invoice_key(series: pd.Series) -> pd.Series:
-    """Normalize invoice IDs to comparable string keys."""
     s = series.fillna("").astype(str).str.strip()
-    s = s.str.replace(r"\s+", "", regex=True)  # remove internal spaces
+    s = s.str.replace(r"\s+", "", regex=True)
     return s.str.upper()
 
 
 def parse_money(value) -> float:
-    """
-    Robust parse for Indonesian/Intl formats.
-    Keeps sign, removes currency & spaces. Decimal inference:
-    - if both ',' and '.' exist → last separator is decimal.
-    - else ',' with 1-2 digits at end → decimal; otherwise thousands.
-    - else '.' with 1-2 digits at end → decimal; otherwise thousands.
-    """
     if pd.isna(value):
         return 0.0
     s = str(value).strip()
@@ -95,8 +160,7 @@ def parse_money(value) -> float:
     s = re.sub(r"[^\d,.\-]", "", s)
     if s.count(",") and s.count("."):
         if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
+            s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
     else:
@@ -113,7 +177,6 @@ def parse_money(value) -> float:
     try:
         return float(s)
     except Exception:
-        # last resort: strip non-digits except minus
         s2 = re.sub(r"[^\d\-]", "", s)
         try:
             return float(s2)
@@ -125,13 +188,7 @@ def coerce_money_series(series: pd.Series) -> pd.Series:
     return series.apply(parse_money).astype(float)
 
 
-def aggregate_by_invoice(
-    df: pd.DataFrame, key_col: str, amount_col: str
-) -> pd.DataFrame:
-    """Group by invoice key and sum amount."""
-    out = pd.DataFrame()
-    if df.empty:
-        return out
+def aggregate_by_invoice(df: pd.DataFrame, key_col: str, amount_col: str) -> pd.DataFrame:
     tmp = df.copy()
     tmp[key_col] = coerce_invoice_key(tmp[key_col])
     tmp[amount_col] = coerce_money_series(tmp[amount_col])
@@ -148,7 +205,6 @@ def reconcile(
     tik_amt: str,
     only_diff: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return (agg_invoice, agg_tiket, merged_result)."""
     a = aggregate_by_invoice(inv_df, inv_key, inv_amt)
     b = aggregate_by_invoice(tik_df, tik_key, tik_amt)
     a = a.rename(columns={inv_key: "Nomor Invoice", inv_amt: "Nominal Invoice"})
@@ -158,9 +214,7 @@ def reconcile(
     merged["Nominal T-Summary"] = merged["Nominal T-Summary"].fillna(0.0)
     merged["Selisih"] = merged["Nominal Invoice"] - merged["Nominal T-Summary"]
     merged["Kategori"] = np.where(
-        merged["Selisih"] > 0,
-        "Naik",
-        np.where(merged["Selisih"] < 0, "Turun", "Sama"),
+        merged["Selisih"] > 0, "Naik", np.where(merged["Selisih"] < 0, "Turun", "Sama")
     )
     if only_diff:
         merged = merged.loc[merged["Selisih"] != 0]
@@ -169,8 +223,8 @@ def reconcile(
 
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Optional[bytes]:
-    """Try to produce an XLSX; fallback None if engine missing."""
     try:
+        import xlsxwriter  # noqa: F401
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
             df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -181,7 +235,6 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Opt
 
 
 def fmt_currency(x: float) -> str:
-    """Format as IDR without symbol; thousands sep dot, decimal comma."""
     if pd.isna(x):
         return ""
     n = float(x)
@@ -191,7 +244,6 @@ def fmt_currency(x: float) -> str:
 
 
 def display_table(df: pd.DataFrame) -> None:
-    """Display numeric columns nicely formatted."""
     if df.empty:
         st.warning("Tidak ada data untuk ditampilkan.")
         return
@@ -199,75 +251,111 @@ def display_table(df: pd.DataFrame) -> None:
     for col in ["Nominal Invoice", "Nominal T-Summary", "Selisih"]:
         if col in display.columns:
             display[col] = display[col].apply(fmt_currency)
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 # ---------- UI ----------
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 
-with st.sidebar:
-    st.header("1) Upload File")
-    f_inv = st.file_uploader("📄 File Invoice (CSV/XLSX)", type=["csv", "xlsx", "xls"])
-    f_tik = st.file_uploader("🎫 File Tiket Summary (CSV/XLSX)", type=["csv", "xlsx", "xls"])
-    st.divider()
-    st.caption("Catatan: Jika ada beberapa Nomor Invoice di file, nilai akan di-*sum* per Nomor Invoice.")
+missing = check_missing_deps()
+with st.expander("ℹ️ Panduan dependency Excel", expanded=bool(missing)):
+    if missing:
+        st.error(
+            "Beberapa paket untuk Excel belum terpasang: **"
+            + ", ".join(missing)
+            + "**.\n\n"
+            "• Pilihan 1: Klik tombol **Install dependencies** (eksperimental; mungkin tidak didukung di semua environment).\n"
+            "• Pilihan 2: Tambahkan file `requirements.txt` berikut lalu jalankan ulang app."
+        )
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button(f"Install dependencies: {', '.join(missing)}"):
+                with st.spinner("Menginstal paket..."):
+                    results = try_install(missing)
+                msgs = [f"{p}: {'OK' if ok else 'GAGAL'}" for p, ok, _ in results]
+                st.write("\n".join(msgs))
+                st.caption("Jika instalasi berhasil, klik **Rerun** di atas atau refresh halaman.")
+        with colB:
+            st.download_button(
+                "Download requirements.txt",
+                data=requirements_txt().encode("utf-8"),
+                file_name="requirements.txt",
+                mime="text/plain",
+            )
+        st.caption("Alternatif cepat: konversi file Excel ke CSV lalu upload.")
+    else:
+        st.success("Semua dependency Excel terdeteksi. Lanjutkan proses.")
 
-df_inv = load_dataframe(f_inv)
-df_tik = load_dataframe(f_tik)
+with st.sidebar:
+    st.header("1) Upload File (Multiple)")
+    f_inv_list = st.file_uploader(
+        "📄 File Invoice (CSV/XLSX) — bisa lebih dari satu",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+    )
+    f_tik_list = st.file_uploader(
+        "🎫 File Tiket Summary (CSV/XLSX) — bisa lebih dari satu",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+    )
+    st.caption("Jika ada beberapa Nomor Invoice di file apapun, nilai akan di-sum per Nomor Invoice.")
+
+df_inv = load_many(f_inv_list)
+df_tik = load_many(f_tik_list)
 
 if not df_inv.empty:
-    st.subheader("Preview: Invoice")
+    st.subheader(f"Preview: Invoice (gabungan {len(f_inv_list or [])} file, {len(df_inv)} baris)")
     st.dataframe(df_inv.head(10), use_container_width=True, hide_index=True)
 if not df_tik.empty:
-    st.subheader("Preview: Tiket Summary")
+    st.subheader(f"Preview: Tiket Summary (gabungan {len(f_tik_list or [])} file, {len(df_tik)} baris)")
     st.dataframe(df_tik.head(10), use_container_width=True, hide_index=True)
 
 if df_inv.empty or df_tik.empty:
-    st.info("Unggah kedua file untuk melanjutkan.")
+    st.info("Unggah minimal satu file untuk **Invoice** dan satu file untuk **Tiket Summary**.")
     st.stop()
 
 st.divider()
 st.subheader("2) Pemetaan Kolom")
 
 invoice_key_guess = guess_column(
-    df_inv.columns,
-    ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"],
+    df_inv.columns, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"]
 )
 invoice_amt_guess = guess_column(
-    df_inv.columns,
-    ["harga", "nilai", "amount", "nominal", "total", "grand total"],
+    df_inv.columns, ["harga", "nilai", "amount", "nominal", "total", "grand total"]
 )
 tiket_key_guess = guess_column(
-    df_tik.columns,
-    ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"],
+    df_tik.columns, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"]
 )
 tiket_amt_guess = guess_column(
-    df_tik.columns,
-    ["tarif", "harga", "nilai", "amount", "nominal", "total", "grand total"],
+    df_tik.columns, ["tarif", "harga", "nilai", "amount", "nominal", "total", "grand total"]
 )
 
 col1, col2 = st.columns(2)
 with col1:
     st.markdown("**Invoice**")
-    inv_key = st.selectbox("Kolom Nomor Invoice (Invoice)", options=list(df_inv.columns), index=(
-        list(df_inv.columns).index(invoice_key_guess) if invoice_key_guess in df_inv.columns else 0
-    ))
-    inv_amt = st.selectbox("Kolom Nominal/Harga (Invoice)", options=list(df_inv.columns), index=(
-        list(df_inv.columns).index(invoice_amt_guess) if invoice_amt_guess in df_inv.columns else 0
-    ))
+    inv_key = st.selectbox(
+        "Kolom Nomor Invoice (Invoice)",
+        options=list(df_inv.columns),
+        index=(list(df_inv.columns).index(invoice_key_guess) if invoice_key_guess in df_inv.columns else 0),
+    )
+    inv_amt = st.selectbox(
+        "Kolom Nominal/Harga (Invoice)",
+        options=list(df_inv.columns),
+        index=(list(df_inv.columns).index(invoice_amt_guess) if invoice_amt_guess in df_inv.columns else 0),
+    )
 with col2:
     st.markdown("**Tiket Summary**")
-    tik_key = st.selectbox("Kolom Nomor Invoice (Tiket Summary)", options=list(df_tik.columns), index=(
-        list(df_tik.columns).index(tiket_key_guess) if tiket_key_guess in df_tik.columns else 0
-    ))
-    tik_amt = st.selectbox("Kolom Nominal/Tarif (Tiket Summary)", options=list(df_tik.columns), index=(
-        list(df_tik.columns).index(tiket_amt_guess) if tiket_amt_guess in df_tik.columns else 0
-    ))
+    tik_key = st.selectbox(
+        "Kolom Nomor Invoice (Tiket Summary)",
+        options=list(df_tik.columns),
+        index=(list(df_tik.columns).index(tiket_key_guess) if tiket_key_guess in df_tik.columns else 0),
+    )
+    tik_amt = st.selectbox(
+        "Kolom Nominal/Tarif (Tiket Summary)",
+        options=list(df_tik.columns),
+        index=(list(df_tik.columns).index(tiket_amt_guess) if tiket_amt_guess in df_tik.columns else 0),
+    )
 
 st.divider()
 st.subheader("3) Proses Rekonsiliasi")
@@ -275,24 +363,17 @@ only_diff = st.checkbox("Hanya tampilkan yang berbeda (Selisih ≠ 0)", value=Fa
 go = st.button("🚀 Proses")
 
 if go:
-    # Validasi kolom
-    missing_msgs = []
     for df, need_cols, src in [
         (df_inv, [inv_key, inv_amt], "Invoice"),
         (df_tik, [tik_key, tik_amt], "Tiket Summary"),
     ]:
         for c in need_cols:
             if c not in df.columns:
-                missing_msgs.append(f"- `{c}` tidak ditemukan di {src}")
-    if missing_msgs:
-        st.error("Kolom tidak ditemukan:\n" + "\n".join(missing_msgs))
-        st.stop()
+                st.error(f"Kolom `{c}` tidak ditemukan di {src}")
+                st.stop()
 
-    agg_inv, agg_tik, merged = reconcile(
-        df_inv, inv_key, inv_amt, df_tik, tik_key, tik_amt, only_diff
-    )
+    agg_inv, agg_tik, merged = reconcile(df_inv, inv_key, inv_amt, df_tik, tik_key, tik_amt, only_diff)
 
-    # Ringkasan
     total_inv = float(agg_inv[agg_inv.columns[1]].sum()) if not agg_inv.empty else 0.0
     total_tik = float(agg_tik[agg_tik.columns[1]].sum()) if not agg_tik.empty else 0.0
     total_diff = float(merged["Selisih"].sum()) if not merged.empty else 0.0
@@ -301,26 +382,17 @@ if go:
     m1.metric("Total Nominal Invoice", fmt_currency(total_inv))
     m2.metric("Total Nominal T-Summary", fmt_currency(total_tik))
     m3.metric("Total Selisih (Invoice − T-Summary)", fmt_currency(total_diff))
-    if not merged.empty:
-        naik = int((merged["Kategori"] == "Naik").sum())
-        turun = int((merged["Kategori"] == "Turun").sum())
-        sama = int((merged["Kategori"] == "Sama").sum())
-    else:
-        naik = turun = sama = 0
+    naik = int((merged["Kategori"] == "Naik").sum()) if not merged.empty else 0
+    turun = int((merged["Kategori"] == "Turun").sum()) if not merged.empty else 0
+    sama = int((merged["Kategori"] == "Sama").sum()) if not merged.empty else 0
     m4.metric("Naik / Turun / Sama", f"{naik} / {turun} / {sama}")
 
     st.subheader("Hasil Rekonsiliasi")
     display_table(merged)
 
-    # Unduhan
     st.markdown("**Unduh Hasil**")
     csv_bytes = merged.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv_bytes,
-        file_name="rekonsiliasi.csv",
-        mime="text/csv",
-    )
+    st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="rekonsiliasi.csv", mime="text/csv")
     xlsx_bytes = df_to_excel_bytes(merged)
     if xlsx_bytes:
         st.download_button(
@@ -330,6 +402,5 @@ if go:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.caption("Excel engine tidak tersedia—gunakan CSV atau tambahkan paket `xlsxwriter`/`openpyxl`.")
-
+        st.caption("Excel engine tidak tersedia—gunakan CSV atau tambahkan paket `xlsxwriter`.")
     st.success("Selesai.")
