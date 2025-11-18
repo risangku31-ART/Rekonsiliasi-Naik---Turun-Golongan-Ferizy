@@ -1,5 +1,5 @@
 # app.py
-# Streamlit Rekonsiliasi Naik/Turun Golongan — Multi-file, CSV+XLS+XLSX uploader
+# Streamlit Rekonsiliasi Naik/Turun Golongan — Multi-file, CSV+XLS+XLSX, with Forced Engine Option
 
 from __future__ import annotations
 
@@ -22,33 +22,34 @@ def has_module(name: str) -> bool:
 
 
 def excel_reader_available() -> bool:
-    # why: beri jalur sukses tanpa konfigurasi lingkungan tertentu
-    return has_module("openpyxl") or has_module("pandas_calamine")
-
-
-def pick_excel_engine(file_suffix: str) -> Optional[str]:
-    sfx = file_suffix.lower()
-    if sfx.endswith(".xls"):
-        return "xlrd" if has_module("xlrd") else None
-    if has_module("openpyxl"):
-        return "openpyxl"
-    if has_module("pandas_calamine"):
-        return "calamine"
-    return None
+    return has_module("openpyxl") or has_module("pandas_calamine") or has_module("xlrd")
 
 
 def excel_writer_available() -> bool:
     return has_module("xlsxwriter")
 
 
-EXCEL_OK = excel_reader_available()
+def available_reader_engines() -> List[str]:
+    engines = []
+    if has_module("openpyxl"):
+        engines.append("openpyxl")
+    if has_module("pandas_calamine"):
+        engines.append("calamine")
+    if has_module("xlrd"):
+        engines.append("xlrd")
+    return engines
+
+
 XLSX_WRITER_OK = excel_writer_available()
 
 
 # ---------- Loaders ----------
 @st.cache_data(show_spinner=False)
-def load_dataframe(file) -> pd.DataFrame:
-    """Load single file; skip Excel if engine unavailable."""
+def load_dataframe(file, forced_engine: str) -> pd.DataFrame:
+    """
+    Load single file; use forced_engine if compatible, else skip with warning.
+    forced_engine in {"Auto", "openpyxl", "calamine", "xlrd"}.
+    """
     if file is None:
         return pd.DataFrame()
     name = file.name
@@ -58,17 +59,41 @@ def load_dataframe(file) -> pd.DataFrame:
         if low.endswith(".csv"):
             return pd.read_csv(file, dtype=str, encoding_errors="ignore")
 
-        if low.endswith((".xlsx", ".xlsm", ".xls")):
-            eng = pick_excel_engine(low)
-            if not eng:
-                st.warning(
-                    f"Lewati `{name}` (Excel) karena engine tidak tersedia. "
-                    f"Pasang `openpyxl`/`pandas-calamine` untuk .xlsx atau `xlrd` untuk .xls, atau konversi ke CSV."
-                )
+        # Excel branches
+        if low.endswith(".xls"):
+            # .xls only supported by xlrd
+            if forced_engine != "Auto" and forced_engine != "xlrd":
+                st.warning(f"Lewati `{name}`: format .xls membutuhkan engine `xlrd`, bukan `{forced_engine}`.")
                 return pd.DataFrame()
-            return pd.read_excel(file, dtype=str, engine=eng)
+            if not has_module("xlrd"):
+                st.warning(f"Lewati `{name}`: engine `xlrd` tidak tersedia. Konversi ke CSV.")
+                return pd.DataFrame()
+            return pd.read_excel(file, dtype=str, engine="xlrd")
 
-        # fallback: coba CSV
+        if low.endswith(".xlsx") or low.endswith(".xlsm"):
+            if forced_engine == "Auto":
+                if has_module("openpyxl"):
+                    return pd.read_excel(file, dtype=str, engine="openpyxl")
+                if has_module("pandas_calamine"):
+                    return pd.read_excel(file, dtype=str, engine="calamine")
+                st.warning(f"Lewati `{name}`: tidak ada engine `openpyxl`/`calamine`. Konversi ke CSV.")
+                return pd.DataFrame()
+            # Forced engine
+            if forced_engine == "openpyxl":
+                if not has_module("openpyxl"):
+                    st.warning(f"Lewati `{name}`: engine `openpyxl` tidak tersedia.")
+                    return pd.DataFrame()
+                return pd.read_excel(file, dtype=str, engine="openpyxl")
+            if forced_engine == "calamine":
+                if not has_module("pandas_calamine"):
+                    st.warning(f"Lewati `{name}`: engine `calamine` tidak tersedia.")
+                    return pd.DataFrame()
+                return pd.read_excel(file, dtype=str, engine="calamine")
+            if forced_engine == "xlrd":
+                st.warning(f"Lewati `{name}`: `xlrd` tidak mendukung .xlsx/.xlsm. Pilih `openpyxl`/`calamine`.")
+                return pd.DataFrame()
+
+        # Fallback: coba CSV
         return pd.read_csv(file, dtype=str, encoding_errors="ignore")
 
     except Exception as e:
@@ -76,12 +101,12 @@ def load_dataframe(file) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_many(files: Optional[List]) -> pd.DataFrame:
+def load_many(files: Optional[List], forced_engine: str) -> pd.DataFrame:
     if not files:
         return pd.DataFrame()
     frames: List[pd.DataFrame] = []
     for f in files:
-        df = load_dataframe(f)
+        df = load_dataframe(f, forced_engine)
         if not df.empty:
             tmp = df.copy()
             tmp["Sumber File"] = f.name
@@ -109,7 +134,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
         try:
             return pd.read_csv(io.StringIO(text), dtype=str, sep=None, engine="python")
         except Exception:
-            st.error("Gagal mengurai data yang ditempel. Pastikan kolom dipisah TAB/;/,/|.")
+            st.error("Gagal mengurai data PASTE. Pastikan kolom dipisah TAB/;/,/|.")
             return pd.DataFrame()
 
 
@@ -257,19 +282,21 @@ def display_table(df: pd.DataFrame) -> None:
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 
-with st.expander("ℹ️ Status engine Excel"):
-    if EXCEL_OK:
-        st.success("Engine pembaca Excel terdeteksi (openpyxl/calamine). Anda dapat upload CSV/XLS/XLSX.")
+with st.expander("ℹ️ Engine Excel"):
+    avail = available_reader_engines()
+    if avail:
+        st.success("Engine tersedia: " + ", ".join(avail))
     else:
-        st.error(
-            "Tidak ada engine untuk membaca .xlsx/.xlsm/.xls. "
-            "File Excel tetap dapat dipilih di uploader namun akan di-skip. "
-            "Solusi cepat: pasang `openpyxl`/`pandas-calamine` (untuk .xlsx) dan `xlrd` (untuk .xls), atau unggah CSV."
-        )
+        st.error("Tidak ada engine Excel. File Excel akan di-skip. Gunakan CSV atau pasang engine.")
+    forced_engine = st.selectbox(
+        "Paksa engine Excel (opsional)",
+        options=["Auto"] + avail,
+        index=0,
+        help="Auto: openpyxl → calamine untuk .xlsx/.xlsm; xlrd untuk .xls.",
+    )
 
 with st.sidebar:
     st.header("1) Upload File (Multiple)")
-    # Selalu izinkan CSV, XLS, XLSX, XLSM seperti permintaan
     f_inv_list = st.file_uploader(
         "📄 File Invoice — bisa banyak",
         type=["csv", "xlsx", "xls", "xlsm"],
@@ -290,13 +317,13 @@ with c2:
     paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV dari Excel)", height=160, placeholder="Tempel data Tiket Summary di sini…")
 
 # Compose sources
-df_inv_files = load_many(f_inv_list)
+df_inv_files = load_many(f_inv_list, forced_engine)
 df_inv_paste = parse_pasted_table(paste_inv)
 if not df_inv_paste.empty:
     df_inv_paste["Sumber File"] = "PASTE:Invoice"
 df_inv = pd.concat([df_inv_files, df_inv_paste], ignore_index=True, sort=False)
 
-df_tik_files = load_many(f_tik_list)
+df_tik_files = load_many(f_tik_list, forced_engine)
 df_tik_paste = parse_pasted_table(paste_tik)
 if not df_tik_paste.empty:
     df_tik_paste["Sumber File"] = "PASTE:TiketSummary"
