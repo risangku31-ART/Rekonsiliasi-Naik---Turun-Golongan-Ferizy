@@ -1,4 +1,50 @@
 # app.py
+# --- Safe Mode & Engine panel (drop-in) ---
+import streamlit as st
+
+def render_mode_engine():
+    # Query param: ?safe=0 untuk langsung OFF
+    qp = st.query_params
+    default_safe = qp.get("safe", ["1"])[0] not in ("0", "false", "off")
+    with st.expander("ℹ️ Mode & Engine", expanded=True):
+        safe_mode = st.toggle(
+            "Safe Mode (CSV & PASTE only) — aktifkan bila install dependencies gagal",
+            value=default_safe,
+            help="Jika ON, file Excel akan di-skip. Matikan untuk memproses Excel.",
+        )
+        # Deteksi engine yang tersedia
+        avail = []
+        try:
+            __import__("openpyxl"); avail.append("openpyxl")
+        except Exception:
+            pass
+        try:
+            __import__("pandas_calamine"); avail.append("calamine")
+        except Exception:
+            pass
+        try:
+            __import__("xlrd"); avail.append("xlrd")
+        except Exception:
+            pass
+
+        if not safe_mode:
+            if avail:
+                st.success("Engine tersedia: " + ", ".join(avail))
+            else:
+                st.warning("Tidak ada engine Excel terpasang. File Excel tetap akan di-skip.")
+        forced_engine = st.selectbox(
+            "Paksa engine Excel",
+            options=(["Auto"] + avail) if not safe_mode else ["Auto"],
+            index=0,
+            help="Auto: .xls→xlrd, .xlsx/.xlsm→openpyxl lalu calamine.",
+        )
+
+        # Badge status agar terlihat jelas
+        st.write(f"**Status:** {'🟢 Safe Mode ON' if safe_mode else '🔵 Safe Mode OFF'}")
+    return safe_mode, forced_engine
+
+# Pemakaian:
+safe_mode, forced_engine = render_mode_engine()
 # Rekonsiliasi Naik/Turun Golongan — Safe Mode default (CSV/PASTE), Excel optional jika engine tersedia.
 
 from __future__ import annotations
