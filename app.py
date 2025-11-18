@@ -1,5 +1,6 @@
 # app.py
-# Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice) + kolom-kolom tambahan di hasil
+# Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)
+# Keberangkatan ← T-Summary: "Asal", Tujuan ← Invoice: "Tujuan"
 
 import csv
 import io
@@ -355,7 +356,6 @@ def ordered_keys(rows: List[Dict[str, str]], key_col: str) -> List[str]:
 
 
 def collect_first_map(rows: List[Dict[str, str]], key_col: str, val_col: Optional[str]) -> Dict[str, str]:
-    """Ambil nilai pertama non-kosong per key."""
     if not val_col:
         return {}
     out: Dict[str, str] = {}
@@ -368,7 +368,6 @@ def collect_first_map(rows: List[Dict[str, str]], key_col: str, val_col: Optiona
 
 
 def collect_unique_join_map(rows: List[Dict[str, str]], key_col: str, val_col: Optional[str], sep: str = ", ") -> Dict[str, str]:
-    """Gabung nilai unik (urutan kemunculan) per key."""
     if not val_col:
         return {}
     out: Dict[str, str] = {}
@@ -475,7 +474,6 @@ with col_b:
 
 st.markdown("**Pemetaan kolom tambahan (opsional, untuk ditampilkan di hasil):**")
 
-# Helper to create select with "— Kosong —"
 def select_with_empty(label: str, options: List[str], guess: Optional[str] = None):
     opts = ["— Kosong —"] + options
     idx = 0
@@ -483,18 +481,18 @@ def select_with_empty(label: str, options: List[str], guess: Optional[str] = Non
         idx = options.index(guess) + 1
     return st.selectbox(label, opts, index=idx)
 
-# Guesses
-inv_tgl_inv_guess = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "tanggal", "tgl"])
-inv_pay_inv_guess = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "pembayaran", "tgl pembayaran"])
-inv_keber_guess   = guess_column(inv_cols, ["keberangkatan", "asal", "origin", "berangkat"])
-inv_channel_guess = guess_column(inv_cols, ["channel"])
-inv_merchant_guess= guess_column(inv_cols, ["merchant", "mid", "acquirer"])
+# Guesses (disesuaikan permintaan)
+inv_tgl_inv_guess   = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "tanggal", "tgl"])
+inv_pay_inv_guess   = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "pembayaran", "tgl pembayaran"])
+inv_tujuan_guess    = guess_column(inv_cols, ["tujuan", "destination", "destinasi"])   # ← Tujuan dari Invoice
+inv_channel_guess   = guess_column(inv_cols, ["channel"])
+inv_merchant_guess  = guess_column(inv_cols, ["merchant", "mid", "acquirer"])
 
 ts_kode_booking_guess = guess_column(tik_cols, ["kode booking", "kode boking", "booking code"])
 ts_nomor_tiket_guess  = guess_column(tik_cols, ["nomor tiket", "no tiket", "ticket"])
 ts_pay_ts_guess       = guess_column(tik_cols, ["pembayaran", "tanggal pembayaran", "tgl bayar", "tgl pembayaran"])
 ts_golongan_guess     = guess_column(tik_cols, ["golongan", "kelas", "class"])
-ts_tujuan_guess       = guess_column(tik_cols, ["tujuan", "destination", "destinasi"])
+ts_asal_guess         = guess_column(tik_cols, ["asal", "keberangkatan", "origin"])    # ← Keberangkatan dari T-Summary (Asal)
 ts_cetak_bp_guess     = guess_column(tik_cols, ["cetak boarding pass", "tgl cetak", "boarding pass"])
 
 c1, c2 = st.columns(2)
@@ -502,7 +500,7 @@ with c1:
     st.markdown("**Tambahan dari Invoice**")
     sel_inv_tgl_inv   = select_with_empty("Tanggal Invoice (Invoice)", inv_cols, inv_tgl_inv_guess)
     sel_inv_pay_inv   = select_with_empty("Tanggal Pembayaran Invoice (kolom di Invoice)", inv_cols, inv_pay_inv_guess)
-    sel_inv_keber     = select_with_empty("Keberangkatan (Invoice)", inv_cols, inv_keber_guess)
+    sel_inv_tujuan    = select_with_empty("Tujuan (Invoice)", inv_cols, inv_tujuan_guess)  # swapped here
     sel_inv_channel   = select_with_empty("Channel (Invoice)", inv_cols, inv_channel_guess)
     sel_inv_merchant  = select_with_empty("Merchant (Invoice)", inv_cols, inv_merchant_guess)
 
@@ -512,25 +510,24 @@ with c2:
     sel_ts_no_tiket   = select_with_empty("Nomor Tiket (T-Summary)", tik_cols, ts_nomor_tiket_guess)
     sel_ts_pay_ts     = select_with_empty("Tanggal Pembayaran T-Summary (kolom 'Pembayaran')", tik_cols, ts_pay_ts_guess)
     sel_ts_golongan   = select_with_empty("Golongan (T-Summary)", tik_cols, ts_golongan_guess)
-    sel_ts_tujuan     = select_with_empty("Tujuan (T-Summary)", tik_cols, ts_tujuan_guess)
+    sel_ts_asal       = select_with_empty("Keberangkatan / Asal (T-Summary)", tik_cols, ts_asal_guess)  # swapped here
     sel_ts_cetak_bp   = select_with_empty("Tgl Cetak Boarding Pass (T-Summary)", tik_cols, ts_cetak_bp_guess)
 
-# Convert selections to None if empty
 def none_if_empty(x: str) -> Optional[str]:
     return None if x == "— Kosong —" else x
 
-inv_tgl_inv_col  = none_if_empty(sel_inv_tgl_inv)
-inv_pay_inv_col  = none_if_empty(sel_inv_pay_inv)
-inv_keber_col    = none_if_empty(sel_inv_keber)
-inv_channel_col  = none_if_empty(sel_inv_channel)
-inv_merchant_col = none_if_empty(sel_inv_merchant)
+inv_tgl_inv_col   = none_if_empty(sel_inv_tgl_inv)
+inv_pay_inv_col   = none_if_empty(sel_inv_pay_inv)
+inv_tujuan_col    = none_if_empty(sel_inv_tujuan)
+inv_channel_col   = none_if_empty(sel_inv_channel)
+inv_merchant_col  = none_if_empty(sel_inv_merchant)
 
-ts_kode_bk_col   = none_if_empty(sel_ts_kode_bk)
-ts_no_tiket_col  = none_if_empty(sel_ts_no_tiket)
-ts_pay_ts_col    = none_if_empty(sel_ts_pay_ts)
-ts_gol_col       = none_if_empty(sel_ts_golongan)
-ts_tujuan_col    = none_if_empty(sel_ts_tujuan)
-ts_cetak_bp_col  = none_if_empty(sel_ts_cetak_bp)
+ts_kode_bk_col    = none_if_empty(sel_ts_kode_bk)
+ts_no_tiket_col   = none_if_empty(sel_ts_no_tiket)
+ts_pay_ts_col     = none_if_empty(sel_ts_pay_ts)
+ts_gol_col        = none_if_empty(sel_ts_golongan)
+ts_asal_col       = none_if_empty(sel_ts_asal)
+ts_cetak_bp_col   = none_if_empty(sel_ts_cetak_bp)
 
 # ----------------------------- SUMIFS (basis Invoice) -----------------------------
 st.divider()
@@ -539,54 +536,51 @@ only_diff = st.checkbox("Hanya tampilkan yang berbeda (Selisih ≠ 0)", value=Fa
 go = st.button("🚀 Proses")
 
 if go:
-    # SUMIFS nominal
     agg_inv = aggregate_sum(rows_inv, inv_key, inv_amt)
     agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)
     keys_ordered = ordered_keys(rows_inv, inv_key)
 
-    # Tambahan (maps)
-    inv_tgl_inv_map  = collect_first_map(rows_inv, inv_key, inv_tgl_inv_col)
-    inv_pay_inv_map  = collect_first_map(rows_inv, inv_key, inv_pay_inv_col)
-    inv_keber_map    = collect_first_map(rows_inv, inv_key, inv_keber_col)
-    inv_channel_map  = collect_first_map(rows_inv, inv_key, inv_channel_col)
-    inv_merchant_map = collect_first_map(rows_inv, inv_key, inv_merchant_col)
+    # Maps tambahan
+    inv_tgl_inv_map   = collect_first_map(rows_inv, inv_key, inv_tgl_inv_col)
+    inv_pay_inv_map   = collect_first_map(rows_inv, inv_key, inv_pay_inv_col)
+    inv_tujuan_map    = collect_first_map(rows_inv, inv_key, inv_tujuan_col)      # ← from Invoice
+    inv_channel_map   = collect_first_map(rows_inv, inv_key, inv_channel_col)
+    inv_merchant_map  = collect_first_map(rows_inv, inv_key, inv_merchant_col)
 
-    ts_kode_bk_map   = collect_unique_join_map(rows_tik, tik_key, ts_kode_bk_col)
-    ts_no_tiket_map  = collect_unique_join_map(rows_tik, tik_key, ts_no_tiket_col)
-    ts_pay_ts_map    = collect_first_map(rows_tik, tik_key, ts_pay_ts_col)
-    ts_gol_map       = collect_unique_join_map(rows_tik, tik_key, ts_gol_col)
-    ts_tujuan_map    = collect_unique_join_map(rows_tik, tik_key, ts_tujuan_col)
-    ts_cetak_bp_map  = collect_unique_join_map(rows_tik, tik_key, ts_cetak_bp_col)
+    ts_kode_bk_map    = collect_unique_join_map(rows_tik, tik_key, ts_kode_bk_col)
+    ts_no_tiket_map   = collect_unique_join_map(rows_tik, tik_key, ts_no_tiket_col)
+    ts_pay_ts_map     = collect_first_map(rows_tik, tik_key, ts_pay_ts_col)
+    ts_gol_map        = collect_unique_join_map(rows_tik, tik_key, ts_gol_col)
+    ts_asal_map       = collect_unique_join_map(rows_tik, tik_key, ts_asal_col)   # ← from T-Summary
+    ts_cetak_bp_map   = collect_unique_join_map(rows_tik, tik_key, ts_cetak_bp_col)
 
     out_rows: List[Dict[str, str]] = []
     total_inv = total_tik = total_diff = 0.0
     naik = turun = sama = 0
 
-    for k in keys_ordered:  # LEFT JOIN berbasis Invoice
+    for k in keys_ordered:
         v_inv = float(agg_inv.get(k, 0.0))
         v_tik = float(agg_tik.get(k, 0.0))
         diff = v_inv - v_tik
         cat = "Naik" if diff > 0 else ("Turun" if diff < 0 else "Sama")
 
         row = {
-            # Kolom tambahan (kosong jika tidak dipetakan/ada)
             "Tanggal Invoice":              inv_tgl_inv_map.get(k, ""),
             "Kode Booking":                 ts_kode_bk_map.get(k, ""),
             "Nomor Tiket":                  ts_no_tiket_map.get(k, ""),
             "Tanggal Pembayaran Invoice":   inv_pay_inv_map.get(k, ""),
             "Tanggal Pembayaran T-Summary": ts_pay_ts_map.get(k, ""),
             "Golongan":                     ts_gol_map.get(k, ""),
-            "Keberangkatan":                inv_keber_map.get(k, ""),
-            "Tujuan":                       ts_tujuan_map.get(k, ""),
+            "Keberangkatan":                ts_asal_map.get(k, ""),       # swapped source
+            "Tujuan":                       inv_tujuan_map.get(k, ""),     # swapped source
             "Tgl Cetak Boarding Pass":      ts_cetak_bp_map.get(k, ""),
             "Channel":                      inv_channel_map.get(k, ""),
             "Merchant":                     inv_merchant_map.get(k, ""),
-            # Kunci & angka
-            "Nomor Invoice": k,
-            "Nominal Invoice (SUMIFS)": format_idr(v_inv),
-            "Nominal T-Summary (SUMIFS)": format_idr(v_tik),
-            "Selisih": format_idr(diff),
-            "Kategori": cat,
+            "Nomor Invoice":                k,
+            "Nominal Invoice (SUMIFS)":     format_idr(v_inv),
+            "Nominal T-Summary (SUMIFS)":   format_idr(v_tik),
+            "Selisih":                      format_idr(diff),
+            "Kategori":                     cat,
         }
 
         if (not only_diff) or (diff != 0):
@@ -612,7 +606,6 @@ if go:
     st.subheader("Hasil Rekonsiliasi (SUMIFS, Basis Invoice)")
     st.data_editor(out_rows, use_container_width=True, disabled=True, key="result")
 
-    # Download CSV (urut kolom sesuai tampilan)
     csv_cols = [
         "Tanggal Invoice",
         "Kode Booking",
