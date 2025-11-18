@@ -1,5 +1,5 @@
 # app.py
-# Rekonsiliasi Naik/Turun Golongan — CSV & PASTE, + fallback XLSX murni-Python (pure-xlsx)
+# Rekonsiliasi Naik/Turun Golongan — Pola SUMIFS (basis: Nomor Invoice dari uploader Invoice)
 
 import csv
 import io
@@ -21,11 +21,11 @@ def has_module(name: str) -> bool:
 
 
 def available_reader_engines() -> List[str]:
-    # 'pure-xlsx' selalu tersedia (untuk .xlsx). Engine lain butuh pandas.
+    # 'pure-xlsx' selalu tersedia untuk .xlsx; engine lain jika ada pandas/ekstensi.
     engines = ["pure-xlsx"]
     if has_module("pandas") and has_module("openpyxl"):
         engines.append("openpyxl")
-    if has_module("pandas") and (has_module("pandas_calamine")):
+    if has_module("pandas") and has_module("pandas_calamine"):
         engines.append("calamine")
     if has_module("pandas") and has_module("xlrd"):
         engines.append("xlrd")
@@ -54,12 +54,10 @@ def read_csv_file(file) -> List[Dict[str, str]]:
     else:
         text = data
     try:
-        dialect = csv.Sniffer().sniff(text[:2048])
-        delim = dialect.delimiter
+        delim = csv.Sniffer().sniff(text[:2048]).delimiter
     except Exception:
         delim = guess_delimiter(text)
-    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
-    return [dict(r) for r in reader]
+    return [dict(r) for r in csv.DictReader(io.StringIO(text), delimiter=delim)]
 
 
 def read_paste(text: str) -> List[Dict[str, str]]:
@@ -68,8 +66,7 @@ def read_paste(text: str) -> List[Dict[str, str]]:
         return []
     delim = guess_delimiter(text)
     try:
-        reader = csv.DictReader(io.StringIO(text), delimiter=delim)
-        return [dict(r) for r in reader]
+        return [dict(r) for r in csv.DictReader(io.StringIO(text), delimiter=delim)]
     except Exception:
         return []
 
@@ -85,10 +82,9 @@ def _xlsx_col_to_idx(col: str) -> int:
     for ch in col:
         if "A" <= ch <= "Z":
             n = n * 26 + (ord(ch) - 64)
-    return n - 1  # zero-based
+    return n - 1
 
 def _xlsx_ref_to_rc(ref: str) -> Tuple[int, int]:
-    # e.g. C5 -> (row=4, col=2) zero-based
     m = re.match(r"([A-Z]+)(\d+)", ref)
     if not m:
         return 0, 0
@@ -101,20 +97,15 @@ def _xlsx_read_shared_strings(z: ZipFile) -> List[str]:
         with z.open("xl/sharedStrings.xml") as f:
             tree = ET.parse(f)
         for si in tree.getroot().iterfind(".//main:si", NS):
-            # collect all <t> inside si (handle rich text)
-            texts = []
-            for t in si.findall(".//main:t", NS):
-                texts.append(t.text or "")
+            texts = [t.text or "" for t in si.findall(".//main:t", NS)]
             sst.append("".join(texts))
     except KeyError:
-        pass  # no sharedStrings
+        pass
     return sst
 
 def _xlsx_find_first_sheet_path(z: ZipFile) -> Optional[str]:
-    # Try common path first
     if "xl/worksheets/sheet1.xml" in z.namelist():
         return "xl/worksheets/sheet1.xml"
-    # Robust: read workbook + rels
     try:
         with z.open("xl/workbook.xml") as f:
             wb = ET.parse(f).getroot()
@@ -126,11 +117,8 @@ def _xlsx_find_first_sheet_path(z: ZipFile) -> Optional[str]:
             rels = ET.parse(f).getroot()
         for rel in rels.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
             if rel.attrib.get("Id") == rid:
-                target = rel.attrib.get("Target")  # e.g. worksheets/sheet1.xml
-                if not target:
-                    return None
-                path = "xl/" + target if not target.startswith("xl/") else target
-                return path
+                target = rel.attrib.get("Target")
+                return "xl/" + target if not target.startswith("xl/") else target
     except KeyError:
         return None
     return None
@@ -141,21 +129,19 @@ def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
     sheet_path = _xlsx_find_first_sheet_path(z)
     if not sheet_path:
         return []
-
     with z.open(sheet_path) as f:
         tree = ET.parse(f)
     root = tree.getroot()
 
-    # Collect cells into a row-wise matrix
     rows_dict: Dict[int, Dict[int, str]] = {}
     max_col = -1
     for c in root.findall(".//main:c", NS):
         ref = c.attrib.get("r", "A1")
-        t = c.attrib.get("t")  # 's', 'inlineStr', 'b', 'str', etc.
+        t = c.attrib.get("t")
         v = c.find("main:v", NS)
         is_node = c.find("main:is", NS)
         text = ""
-        if t == "s":  # shared string
+        if t == "s":
             idx = int(v.text) if v is not None and v.text else -1
             text = sst[idx] if 0 <= idx < len(sst) else ""
         elif t == "inlineStr" and is_node is not None:
@@ -164,17 +150,14 @@ def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
         elif t == "b":
             text = "TRUE" if (v is not None and v.text == "1") else "FALSE"
         else:
-            text = (v.text or "") if v is not None else ""  # number or plain
-
+            text = (v.text or "") if v is not None else ""
         r, cidx = _xlsx_ref_to_rc(ref)
-        row_map = rows_dict.setdefault(r, {})
-        row_map[cidx] = text
+        rows_dict.setdefault(r, {})[cidx] = text
         max_col = max(max_col, cidx)
 
     if not rows_dict:
         return []
 
-    # Build 2D rows ordered by row index
     matrix: List[List[str]] = []
     for r in sorted(rows_dict.keys()):
         row = ["" for _ in range(max_col + 1)]
@@ -183,7 +166,7 @@ def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
                 row[cidx] = val
         matrix.append(row)
 
-    # First non-empty row as header
+    # Header = baris non-kosong pertama
     header: List[str] = []
     data_start = 0
     for i, row in enumerate(matrix):
@@ -194,7 +177,7 @@ def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
     if not header:
         return []
 
-    # Deduplicate empty/duplicate headers
+    # Pastikan header unik
     norm = {}
     final_header = []
     for h in header:
@@ -233,15 +216,13 @@ def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]
                 if safe_mode:
                     st.warning(f"Lewati `{f.name}` (Excel) karena Safe Mode aktif. Unggah CSV atau matikan Safe Mode.")
                 else:
-                    # engine selection
                     if forced_engine == "pure-xlsx" or (forced_engine == "Auto" and "pure-xlsx" in available_reader_engines()):
                         f.seek(0)
                         data = f.read()
                         rows = read_xlsx_pure(data)
                     else:
-                        # coba via pandas jika tersedia
                         if not has_module("pandas"):
-                            st.warning(f"Lewati `{f.name}`: pandas tidak tersedia. Gunakan engine `pure-xlsx` atau unggah CSV.")
+                            st.warning(f"Lewati `{f.name}`: pandas tidak tersedia. Pilih `pure-xlsx`.")
                         else:
                             import pandas as pd
                             eng = None
@@ -273,7 +254,7 @@ def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]
     return out
 
 
-# ----------------------------- Business logic -----------------------------
+# ----------------------------- Business logic (SUMIFS) -----------------------------
 def normalize_colname(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"[^a-z0-9]+", " ", s)
@@ -366,24 +347,35 @@ def aggregate_sum(rows: List[Dict[str, str]], key_col: str, amt_col: str) -> Dic
     return out
 
 
+def ordered_keys(rows: List[Dict[str, str]], key_col: str) -> List[str]:
+    seen = set()
+    order: List[str] = []
+    for r in rows:
+        k = coerce_invoice_key(r.get(key_col, ""))
+        if k and k not in seen:
+            seen.add(k)
+            order.append(k)
+    return order
+
+
 # ----------------------------- UI -----------------------------
-st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
+st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan (SUMIFS)", layout="wide")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)")
 
 with st.expander("ℹ️ Mode & Engine", expanded=True):
     safe_mode = st.toggle(
-        "Safe Mode (CSV & PASTE only) — aktifkan bila install dependencies gagal",
+        "Safe Mode (CSV & PASTE only)",
         value=False,
-        help="Jika ON, Excel di-skip. Matikan untuk memproses .xlsx (pure-xlsx) atau engine lain.",
+        help="ON: lewati Excel. OFF: .xlsx diproses via engine atau pure-xlsx.",
     )
     avail = available_reader_engines()
     forced_engine = st.selectbox(
         "Paksa engine Excel",
         options=(["Auto"] + avail) if not safe_mode else ["Auto"],
         index=0,
-        help="Auto: openpyxl→calamine→pure-xlsx untuk .xlsx; .xls disarankan konversi ke CSV/.xlsx.",
+        help="Auto: openpyxl→calamine→pure-xlsx (.xlsx). .xls disarankan konversi ke CSV/.xlsx.",
     )
-    st.write(f"**Status:** {'🟢 Safe Mode ON' if safe_mode else '🔵 Safe Mode OFF'} — Engine tersedia: {', '.join(avail)}")
+    st.write(f"**Status:** {'🟢 Safe Mode ON' if safe_mode else '🔵 Safe Mode OFF'} — Engine: {', '.join(avail)}")
 
 with st.sidebar:
     st.header("1) Upload File (Multiple)")
@@ -397,7 +389,7 @@ with st.sidebar:
         type=["csv", "xlsx", "xlsm", "xls"],
         accept_multiple_files=True,
     )
-    st.caption("Jika tidak ada engine, pilih `pure-xlsx` untuk .xlsx; .xls lama akan di-skip.")
+    st.caption("Patokan = Nomor Invoice dari uploader Invoice (SUMIFS/LEFT JOIN).")
 
 st.subheader("Opsional: Tempel Data dari Excel")
 c1, c2 = st.columns(2)
@@ -426,7 +418,7 @@ if rows_tik:
     st.data_editor(rows_tik[: min(10, len(rows_tik))], use_container_width=True, disabled=True, key="prev_tik")
 
 if not rows_inv or not rows_tik:
-    st.info("Unggah minimal satu file atau tempel data untuk **Invoice** dan **Tiket Summary**.")
+    st.info("Unggah minimal satu file/PASTE untuk **Invoice** dan **Tiket Summary**.")
     st.stop()
 
 # Mapping
@@ -449,22 +441,22 @@ with c4:
     tik_key = st.selectbox("Kolom Nomor Invoice (Tiket Summary)", tik_cols, index=tik_cols.index(tik_key_guess) if tik_key_guess in tik_cols else 0)
     tik_amt = st.selectbox("Kolom Nominal/Tarif (Tiket Summary)", tik_cols, index=tik_cols.index(tik_amt_guess) if tik_amt_guess in tik_cols else 0)
 
-# Process
+# SUMIFS (basis: uploader Invoice)
 st.divider()
-st.subheader("3) Proses Rekonsiliasi")
+st.subheader("3) Proses Rekonsiliasi — SUMIFS (Basis Invoice)")
 only_diff = st.checkbox("Hanya tampilkan yang berbeda (Selisih ≠ 0)", value=False)
 go = st.button("🚀 Proses")
 
 if go:
-    agg_inv = aggregate_sum(rows_inv, inv_key, inv_amt)
-    agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)
+    agg_inv = aggregate_sum(rows_inv, inv_key, inv_amt)   # SUMIFS sumber Invoice
+    agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)   # SUMIFS sumber Tiket Summary
+    keys_ordered = ordered_keys(rows_inv, inv_key)        # urutan sesuai kemunculan di uploader Invoice
 
-    all_keys = sorted(set(agg_inv.keys()) | set(agg_tik.keys()))
     out_rows: List[Dict[str, str]] = []
     total_inv = total_tik = total_diff = 0.0
     naik = turun = sama = 0
 
-    for k in all_keys:
+    for k in keys_ordered:  # LEFT JOIN berbasis Invoice
         v_inv = float(agg_inv.get(k, 0.0))
         v_tik = float(agg_tik.get(k, 0.0))
         diff = v_inv - v_tik
@@ -473,8 +465,8 @@ if go:
             out_rows.append(
                 {
                     "Nomor Invoice": k,
-                    "Nominal Invoice": format_idr(v_inv),
-                    "Nominal T-Summary": format_idr(v_tik),
+                    "Nominal Invoice (SUMIFS)": format_idr(v_inv),
+                    "Nominal T-Summary (SUMIFS)": format_idr(v_tik),
                     "Selisih": format_idr(diff),
                     "Kategori": cat,
                 }
@@ -482,26 +474,27 @@ if go:
         total_inv += v_inv
         total_tik += v_tik
         total_diff += diff
-        if cat == "Naik":
-            naik += 1
-        elif cat == "Turun":
-            turun += 1
-        else:
-            sama += 1
+        if cat == "Naik": naik += 1
+        elif cat == "Turun": turun += 1
+        else: sama += 1
+
+    extra_tik_only = len(set(agg_tik.keys()) - set(keys_ordered))
+    if extra_tik_only:
+        st.caption(f"ℹ️ {extra_tik_only} Nomor Invoice hanya ada di Tiket Summary (diabaikan — basis Invoice).")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Nominal Invoice", format_idr(total_inv))
-    m2.metric("Total Nominal T-Summary", format_idr(total_tik))
-    m3.metric("Total Selisih (Invoice − T-Summary)", format_idr(total_diff))
+    m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
+    m2.metric("Total T-Summary (SUMIFS)", format_idr(total_tik))
+    m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
     m4.metric("Naik / Turun / Sama", f"{naik} / {turun} / {sama}")
 
-    st.subheader("Hasil Rekonsiliasi")
+    st.subheader("Hasil Rekonsiliasi (SUMIFS, Basis Invoice)")
     st.data_editor(out_rows, use_container_width=True, disabled=True, key="result")
 
     # Download CSV
     si = io.StringIO()
     w = csv.writer(si)
-    w.writerow(["Nomor Invoice", "Nominal Invoice", "Nominal T-Summary", "Selisih", "Kategori"])
+    w.writerow(["Nomor Invoice", "Nominal Invoice (SUMIFS)", "Nominal T-Summary (SUMIFS)", "Selisih", "Kategori"])
     for r in out_rows:
-        w.writerow([r["Nomor Invoice"], r["Nominal Invoice"], r["Nominal T-Summary"], r["Selisih"], r["Kategori"]])
-    st.download_button("⬇️ Download CSV", data=si.getvalue().encode("utf-8"), file_name="rekonsiliasi.csv", mime="text/csv")
+        w.writerow([r["Nomor Invoice"], r["Nominal Invoice (SUMIFS)"], r["Nominal T-Summary (SUMIFS)"], r["Selisih"], r["Kategori"]])
+    st.download_button("⬇️ Download CSV", data=si.getvalue().encode("utf-8"), file_name="rekonsiliasi_sumifs_basis_invoice.csv", mime="text/csv")
