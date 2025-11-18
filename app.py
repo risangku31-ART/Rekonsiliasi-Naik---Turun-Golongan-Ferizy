@@ -1,5 +1,5 @@
 # app.py
-# Streamlit Rekonsiliasi Naik/Turun Golongan — Multi-file, CSV & PASTE fallback (tanpa engine Excel)
+# Streamlit Rekonsiliasi Naik/Turun Golongan — Multi-file, CSV+XLS+XLSX uploader
 
 from __future__ import annotations
 
@@ -13,24 +13,32 @@ import streamlit as st
 
 
 # ---------- Capability detection ----------
-def excel_reader_available() -> bool:
+def has_module(name: str) -> bool:
     try:
-        __import__("openpyxl")
-        return True
-    except Exception:
-        try:
-            __import__("pandas_calamine")
-            return True
-        except Exception:
-            return False
-
-
-def excel_writer_available() -> bool:
-    try:
-        __import__("xlsxwriter")
+        __import__(name)
         return True
     except Exception:
         return False
+
+
+def excel_reader_available() -> bool:
+    # why: beri jalur sukses tanpa konfigurasi lingkungan tertentu
+    return has_module("openpyxl") or has_module("pandas_calamine")
+
+
+def pick_excel_engine(file_suffix: str) -> Optional[str]:
+    sfx = file_suffix.lower()
+    if sfx.endswith(".xls"):
+        return "xlrd" if has_module("xlrd") else None
+    if has_module("openpyxl"):
+        return "openpyxl"
+    if has_module("pandas_calamine"):
+        return "calamine"
+    return None
+
+
+def excel_writer_available() -> bool:
+    return has_module("xlsxwriter")
 
 
 EXCEL_OK = excel_reader_available()
@@ -40,47 +48,35 @@ XLSX_WRITER_OK = excel_writer_available()
 # ---------- Loaders ----------
 @st.cache_data(show_spinner=False)
 def load_dataframe(file) -> pd.DataFrame:
-    """Load single file to DataFrame (dtype=str). Excel only if EXCEL_OK."""
+    """Load single file; skip Excel if engine unavailable."""
     if file is None:
         return pd.DataFrame()
-    name = file.name.lower()
+    name = file.name
+    low = name.lower()
     try:
         file.seek(0)
-        if name.endswith(".csv"):
+        if low.endswith(".csv"):
             return pd.read_csv(file, dtype=str, encoding_errors="ignore")
-        if name.endswith((".xlsx", ".xlsm", ".xls")):
-            if not EXCEL_OK:
-                # why: user needs actionable guidance instead of stacktrace
+
+        if low.endswith((".xlsx", ".xlsm", ".xls")):
+            eng = pick_excel_engine(low)
+            if not eng:
                 st.warning(
-                    f"Lewati `{file.name}` (Excel) karena engine Excel tidak tersedia. "
-                    f"Konversi ke CSV atau gunakan PASTE."
+                    f"Lewati `{name}` (Excel) karena engine tidak tersedia. "
+                    f"Pasang `openpyxl`/`pandas-calamine` untuk .xlsx atau `xlrd` untuk .xls, atau konversi ke CSV."
                 )
                 return pd.DataFrame()
-            # Prefer openpyxl, else calamine; xlrd untuk .xls jika tersedia
-            engine = None
-            if name.endswith(".xls"):
-                try:
-                    import xlrd  # noqa: F401
-                    engine = "xlrd"
-                except Exception:
-                    st.warning(f"Lewati `{file.name}` (.xls) — butuh paket `xlrd`. Konversi ke CSV.")
-                    return pd.DataFrame()
-            if engine is None:
-                try:
-                    import openpyxl  # noqa: F401
-                    engine = "openpyxl"
-                except Exception:
-                    engine = "calamine"
-            return pd.read_excel(file, dtype=str, engine=engine)
-        # default: coba CSV
+            return pd.read_excel(file, dtype=str, engine=eng)
+
+        # fallback: coba CSV
         return pd.read_csv(file, dtype=str, encoding_errors="ignore")
+
     except Exception as e:
-        st.error(f"Gagal membaca `{file.name}`: {e}")
+        st.error(f"Gagal membaca `{name}`: {e}")
         return pd.DataFrame()
 
 
 def load_many(files: Optional[List]) -> pd.DataFrame:
-    """Concat many uploaded files; add 'Sumber File' for audit."""
     if not files:
         return pd.DataFrame()
     frames: List[pd.DataFrame] = []
@@ -96,11 +92,9 @@ def load_many(files: Optional[List]) -> pd.DataFrame:
 
 
 def parse_pasted_table(text: str) -> pd.DataFrame:
-    """Parse pasted CSV/TSV from Excel. Auto-detect separator."""
     text = (text or "").strip()
     if not text:
         return pd.DataFrame()
-    # detect separator priority: tab, semicolon, comma, pipe
     if "\t" in text:
         sep = "\t"
     elif text.count(";") >= text.count(",") and ";" in text:
@@ -112,11 +106,10 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
     try:
         return pd.read_csv(io.StringIO(text), dtype=str, sep=sep)
     except Exception:
-        # fallback engine=python sniff
         try:
             return pd.read_csv(io.StringIO(text), dtype=str, sep=None, engine="python")
         except Exception:
-            st.error("Gagal mengurai data yang ditempel. Pastikan kolom dipisah TAB/;/,/| dan baris per baris.")
+            st.error("Gagal mengurai data yang ditempel. Pastikan kolom dipisah TAB/;/,/|.")
             return pd.DataFrame()
 
 
@@ -264,38 +257,37 @@ def display_table(df: pd.DataFrame) -> None:
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 
-with st.expander("ℹ️ Mode input"):
+with st.expander("ℹ️ Status engine Excel"):
     if EXCEL_OK:
-        st.success("Engine Excel tersedia. Anda dapat upload CSV/XLSX/XLSM/XLS.")
+        st.success("Engine pembaca Excel terdeteksi (openpyxl/calamine). Anda dapat upload CSV/XLS/XLSX.")
     else:
         st.error(
-            "Tidak ada engine untuk membaca .xlsx/.xlsm. "
-            "Solusi cepat: **Save As CSV** di Excel, atau **Copy dari Excel lalu PASTE** ke area di bawah."
+            "Tidak ada engine untuk membaca .xlsx/.xlsm/.xls. "
+            "File Excel tetap dapat dipilih di uploader namun akan di-skip. "
+            "Solusi cepat: pasang `openpyxl`/`pandas-calamine` (untuk .xlsx) dan `xlrd` (untuk .xls), atau unggah CSV."
         )
-        st.caption("Tip: di Excel → pilih tabel → Ctrl+C → paste di textarea; pemisah TAB/;/, otomatis terdeteksi.")
 
 with st.sidebar:
     st.header("1) Upload File (Multiple)")
-    inv_types = ["csv", "xlsx", "xlsm", "xls"] if EXCEL_OK else ["csv"]
-    tik_types = inv_types
+    # Selalu izinkan CSV, XLS, XLSX, XLSM seperti permintaan
     f_inv_list = st.file_uploader(
         "📄 File Invoice — bisa banyak",
-        type=inv_types,
+        type=["csv", "xlsx", "xls", "xlsm"],
         accept_multiple_files=True,
     )
     f_tik_list = st.file_uploader(
         "🎫 File Tiket Summary — bisa banyak",
-        type=tik_types,
+        type=["csv", "xlsx", "xls", "xlsm"],
         accept_multiple_files=True,
     )
-    st.caption("Nilai akan di-sum per Nomor Invoice, lalu dibandingkan.")
+    st.caption("Nilai di-sum per Nomor Invoice, lalu dibandingkan.")
 
 st.subheader("Opsional: Tempel Data dari Excel")
 c1, c2 = st.columns(2)
 with c1:
-    paste_inv = st.text_area("PASTE — Invoice (TSV/CSV dari Excel)", height=180, placeholder="Tempel data Invoice di sini…")
+    paste_inv = st.text_area("PASTE — Invoice (TSV/CSV dari Excel)", height=160, placeholder="Tempel data Invoice di sini…")
 with c2:
-    paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV dari Excel)", height=180, placeholder="Tempel data Tiket Summary di sini…")
+    paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV dari Excel)", height=160, placeholder="Tempel data Tiket Summary di sini…")
 
 # Compose sources
 df_inv_files = load_many(f_inv_list)
@@ -319,7 +311,7 @@ if not df_tik.empty:
     st.dataframe(df_tik.head(10), use_container_width=True, hide_index=True)
 
 if df_inv.empty or df_tik.empty:
-    st.info("Unggah minimal satu file CSV **atau** tempel data untuk **Invoice** dan **Tiket Summary**.")
+    st.info("Unggah minimal satu file (CSV/XLS/XLSX) atau tempel data untuk **Invoice** dan **Tiket Summary**.")
     st.stop()
 
 st.divider()
