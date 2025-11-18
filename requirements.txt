@@ -1,6 +1,8 @@
-streamlit>=1.33
-pandas>=2.1
-openpyxl>=3.1.2
-pandas-calamine>=0.2.0
-xlsxwriter>=3.1
-xlrd>=2.0.1
+# requirements.txt
+# versi dipin untuk mencegah gagal build di platform
+streamlit>=1.28,<1.40
+pandas>=2.1,<2.3
+openpyxl==3.1.5          # .xlsx reader (pure python)
+pandas-calamine==0.2.3   # alternatif reader .xlsx (wheel siap-pakai)
+xlsxwriter==3.2.0        # writer .xlsx
+xlrd==2.0.1              # .xls legacy
