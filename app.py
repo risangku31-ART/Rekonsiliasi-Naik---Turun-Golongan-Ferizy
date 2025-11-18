@@ -1,12 +1,10 @@
 # app.py
-# Streamlit Rekonsiliasi Naik/Turun Golongan (Multi-file, Excel reader fallback)
+# Streamlit Rekonsiliasi Naik/Turun Golongan — Multi-file, CSV & PASTE fallback (tanpa engine Excel)
 
 from __future__ import annotations
 
 import io
 import re
-import sys
-import subprocess
 from typing import Iterable, Optional, Tuple, List
 
 import numpy as np
@@ -14,80 +12,35 @@ import pandas as pd
 import streamlit as st
 
 
-# ---------- Dependency helper ----------
-def has_module(name: str) -> bool:
+# ---------- Capability detection ----------
+def excel_reader_available() -> bool:
     try:
-        __import__(name)
+        __import__("openpyxl")
+        return True
+    except Exception:
+        try:
+            __import__("pandas_calamine")
+            return True
+        except Exception:
+            return False
+
+
+def excel_writer_available() -> bool:
+    try:
+        __import__("xlsxwriter")
         return True
     except Exception:
         return False
 
 
-def available_excel_readers() -> List[str]:
-    readers = []
-    if has_module("openpyxl"):
-        readers.append("openpyxl")
-    if has_module("pandas_calamine") or has_module("calamine") or has_module("pandas_calamine.extensions"):
-        readers.append("calamine")
-    return readers
+EXCEL_OK = excel_reader_available()
+XLSX_WRITER_OK = excel_writer_available()
 
 
-def pick_excel_engine() -> str:
-    readers = available_excel_readers()
-    if "openpyxl" in readers:
-        return "openpyxl"
-    if "calamine" in readers:
-        return "calamine"
-    raise ImportError(
-        "Tidak ada engine pembaca Excel .xlsx/.xlsm. Pasang salah satu: "
-        "`openpyxl` atau `pandas-calamine` (engine='calamine')."
-    )
-
-
-def check_missing_deps() -> List[str]:
-    missing = []
-    # Reader options: at least one of openpyxl/calamine
-    if not (has_module("openpyxl") or has_module("pandas_calamine")):
-        missing.append("openpyxl atau pandas-calamine")
-    # Writer
-    if not has_module("xlsxwriter"):
-        missing.append("xlsxwriter")
-    # Legacy .xls reader
-    if not has_module("xlrd"):
-        missing.append("xlrd (untuk .xls)")
-    return missing
-
-
-def requirements_txt() -> str:
-    # Kedua opsi reader disertakan; cukup salah satunya terpasang agar bisa baca .xlsx
-    return "\n".join(
-        [
-            "streamlit>=1.33",
-            "pandas>=2.1",
-            "openpyxl>=3.1.2",
-            "pandas-calamine>=0.2.0",
-            "xlsxwriter>=3.1",
-            "xlrd>=2.0.1",
-            "",
-        ]
-    )
-
-
-def try_install(pkgs: List[str]) -> List[Tuple[str, bool, str]]:
-    results = []
-    for pkg in pkgs:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-            results.append((pkg, True, "installed"))
-        except Exception as e:
-            results.append((pkg, False, str(e)))
-    return results
-
-
-# ---------- Util ----------
+# ---------- Loaders ----------
 @st.cache_data(show_spinner=False)
 def load_dataframe(file) -> pd.DataFrame:
-    """Load single CSV/XLS/XLSX into DataFrame (dtype=str)."""
+    """Load single file to DataFrame (dtype=str). Excel only if EXCEL_OK."""
     if file is None:
         return pd.DataFrame()
     name = file.name.lower()
@@ -95,49 +48,79 @@ def load_dataframe(file) -> pd.DataFrame:
         file.seek(0)
         if name.endswith(".csv"):
             return pd.read_csv(file, dtype=str, encoding_errors="ignore")
-
-        if name.endswith(".xlsx") or name.endswith(".xlsm"):
-            engine = pick_excel_engine()
+        if name.endswith((".xlsx", ".xlsm", ".xls")):
+            if not EXCEL_OK:
+                # why: user needs actionable guidance instead of stacktrace
+                st.warning(
+                    f"Lewati `{file.name}` (Excel) karena engine Excel tidak tersedia. "
+                    f"Konversi ke CSV atau gunakan PASTE."
+                )
+                return pd.DataFrame()
+            # Prefer openpyxl, else calamine; xlrd untuk .xls jika tersedia
+            engine = None
+            if name.endswith(".xls"):
+                try:
+                    import xlrd  # noqa: F401
+                    engine = "xlrd"
+                except Exception:
+                    st.warning(f"Lewati `{file.name}` (.xls) — butuh paket `xlrd`. Konversi ke CSV.")
+                    return pd.DataFrame()
+            if engine is None:
+                try:
+                    import openpyxl  # noqa: F401
+                    engine = "openpyxl"
+                except Exception:
+                    engine = "calamine"
             return pd.read_excel(file, dtype=str, engine=engine)
-
-        if name.endswith(".xls"):
-            # Pandas butuh xlrd untuk .xls
-            if not has_module("xlrd"):
-                raise ImportError("File .xls membutuhkan paket 'xlrd'.")
-            return pd.read_excel(file, dtype=str, engine="xlrd")
-
         # default: coba CSV
-        file.seek(0)
         return pd.read_csv(file, dtype=str, encoding_errors="ignore")
-
-    except ImportError as e:
-        st.error(f"Gagal membaca file `{file.name}`: {e}")
-        st.info(
-            "Opsi solusi:\n"
-            "1) Install `openpyxl` **atau** `pandas-calamine` (untuk .xlsx/.xlsm), dan `xlrd` untuk .xls.\n"
-            "2) Konversi Excel ke CSV lalu upload."
-        )
-        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Gagal membaca file `{file.name}`: {e}")
+        st.error(f"Gagal membaca `{file.name}`: {e}")
         return pd.DataFrame()
 
 
 def load_many(files: Optional[List]) -> pd.DataFrame:
+    """Concat many uploaded files; add 'Sumber File' for audit."""
     if not files:
         return pd.DataFrame()
     frames: List[pd.DataFrame] = []
     for f in files:
         df = load_dataframe(f)
         if not df.empty:
-            temp = df.copy()
-            temp["Sumber File"] = f.name
-            frames.append(temp)
+            tmp = df.copy()
+            tmp["Sumber File"] = f.name
+            frames.append(tmp)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
+def parse_pasted_table(text: str) -> pd.DataFrame:
+    """Parse pasted CSV/TSV from Excel. Auto-detect separator."""
+    text = (text or "").strip()
+    if not text:
+        return pd.DataFrame()
+    # detect separator priority: tab, semicolon, comma, pipe
+    if "\t" in text:
+        sep = "\t"
+    elif text.count(";") >= text.count(",") and ";" in text:
+        sep = ";"
+    elif "," in text:
+        sep = ","
+    else:
+        sep = "|"
+    try:
+        return pd.read_csv(io.StringIO(text), dtype=str, sep=sep)
+    except Exception:
+        # fallback engine=python sniff
+        try:
+            return pd.read_csv(io.StringIO(text), dtype=str, sep=None, engine="python")
+        except Exception:
+            st.error("Gagal mengurai data yang ditempel. Pastikan kolom dipisah TAB/;/,/| dan baris per baris.")
+            return pd.DataFrame()
+
+
+# ---------- Helpers ----------
 def guess_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
     cols = list(columns)
     norm = {c: normalize_colname(c) for c in cols}
@@ -248,22 +231,20 @@ def reconcile(
 
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Optional[bytes]:
-    try:
-        import xlsxwriter  # noqa: F401
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
-        buffer.seek(0)
-        return buffer.getvalue()
-    except Exception:
+    if not XLSX_WRITER_OK:
         return None
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def fmt_currency(x: float) -> str:
     if pd.isna(x):
         return ""
     n = float(x)
-    s = f"{n:,.2f}"  # 1,234,567.89
+    s = f"{n:,.2f}"
     s = s.replace(",", "_").replace(".", ",").replace("_", ".")
     return s
 
@@ -283,65 +264,62 @@ def display_table(df: pd.DataFrame) -> None:
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 
-readers = available_excel_readers()
-missing = check_missing_deps()
-
-with st.expander("ℹ️ Status dependency Excel", expanded=not readers):
-    if readers:
-        st.success(f"Engine pembaca Excel terdeteksi: **{', '.join(readers)}**.")
+with st.expander("ℹ️ Mode input"):
+    if EXCEL_OK:
+        st.success("Engine Excel tersedia. Anda dapat upload CSV/XLSX/XLSM/XLS.")
     else:
         st.error(
-            "Tidak ada engine untuk membaca .xlsx/.xlsm. Pasang **openpyxl** atau **pandas-calamine**.\n"
-            "Jika tidak memungkinkan, konversi file ke CSV."
+            "Tidak ada engine untuk membaca .xlsx/.xlsm. "
+            "Solusi cepat: **Save As CSV** di Excel, atau **Copy dari Excel lalu PASTE** ke area di bawah."
         )
-    if missing:
-        st.caption("Paket yang disarankan:")
-        st.code(requirements_txt(), language="text")
-        st.download_button(
-            "Download requirements.txt",
-            data=requirements_txt().encode("utf-8"),
-            file_name="requirements.txt",
-            mime="text/plain",
-        )
-        if st.button("Coba install otomatis (eksperimental)"):
-            pkgs = []
-            if not (has_module("openpyxl") or has_module("pandas_calamine")):
-                pkgs.extend(["openpyxl", "pandas-calamine"])
-            if not has_module("xlsxwriter"):
-                pkgs.append("xlsxwriter")
-            if not has_module("xlrd"):
-                pkgs.append("xlrd")
-            with st.spinner("Menginstal paket..."):
-                results = try_install(pkgs)
-            st.write("\n".join([f"{p}: {'OK' if ok else 'GAGAL'}" for p, ok, _ in results]))
-            st.caption("Jika berhasil, klik **Rerun** atau refresh halaman.")
+        st.caption("Tip: di Excel → pilih tabel → Ctrl+C → paste di textarea; pemisah TAB/;/, otomatis terdeteksi.")
 
 with st.sidebar:
     st.header("1) Upload File (Multiple)")
+    inv_types = ["csv", "xlsx", "xlsm", "xls"] if EXCEL_OK else ["csv"]
+    tik_types = inv_types
     f_inv_list = st.file_uploader(
-        "📄 File Invoice (CSV/XLSX/XLSM/XLS) — bisa lebih dari satu",
-        type=["csv", "xlsx", "xlsm", "xls"],
+        "📄 File Invoice — bisa banyak",
+        type=inv_types,
         accept_multiple_files=True,
     )
     f_tik_list = st.file_uploader(
-        "🎫 File Tiket Summary (CSV/XLSX/XLSM/XLS) — bisa lebih dari satu",
-        type=["csv", "xlsx", "xlsm", "xls"],
+        "🎫 File Tiket Summary — bisa banyak",
+        type=tik_types,
         accept_multiple_files=True,
     )
-    st.caption("Jika ada beberapa Nomor Invoice di file apapun, nilai akan di-sum per Nomor Invoice.")
+    st.caption("Nilai akan di-sum per Nomor Invoice, lalu dibandingkan.")
 
-df_inv = load_many(f_inv_list)
-df_tik = load_many(f_tik_list)
+st.subheader("Opsional: Tempel Data dari Excel")
+c1, c2 = st.columns(2)
+with c1:
+    paste_inv = st.text_area("PASTE — Invoice (TSV/CSV dari Excel)", height=180, placeholder="Tempel data Invoice di sini…")
+with c2:
+    paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV dari Excel)", height=180, placeholder="Tempel data Tiket Summary di sini…")
 
+# Compose sources
+df_inv_files = load_many(f_inv_list)
+df_inv_paste = parse_pasted_table(paste_inv)
+if not df_inv_paste.empty:
+    df_inv_paste["Sumber File"] = "PASTE:Invoice"
+df_inv = pd.concat([df_inv_files, df_inv_paste], ignore_index=True, sort=False)
+
+df_tik_files = load_many(f_tik_list)
+df_tik_paste = parse_pasted_table(paste_tik)
+if not df_tik_paste.empty:
+    df_tik_paste["Sumber File"] = "PASTE:TiketSummary"
+df_tik = pd.concat([df_tik_files, df_tik_paste], ignore_index=True, sort=False)
+
+# Previews
 if not df_inv.empty:
-    st.subheader(f"Preview: Invoice (gabungan {len(f_inv_list or [])} file, {len(df_inv)} baris)")
+    st.subheader(f"Preview: Invoice (gabungan {len(df_inv)} baris)")
     st.dataframe(df_inv.head(10), use_container_width=True, hide_index=True)
 if not df_tik.empty:
-    st.subheader(f"Preview: Tiket Summary (gabungan {len(f_tik_list or [])} file, {len(df_tik)} baris)")
+    st.subheader(f"Preview: Tiket Summary (gabungan {len(df_tik)} baris)")
     st.dataframe(df_tik.head(10), use_container_width=True, hide_index=True)
 
 if df_inv.empty or df_tik.empty:
-    st.info("Unggah minimal satu file untuk **Invoice** dan satu file untuk **Tiket Summary**.")
+    st.info("Unggah minimal satu file CSV **atau** tempel data untuk **Invoice** dan **Tiket Summary**.")
     st.stop()
 
 st.divider()
@@ -431,5 +409,5 @@ if go:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.caption("Excel engine tidak tersedia—gunakan CSV atau tambahkan paket `xlsxwriter`.")
+        st.caption("Excel writer tidak tersedia—gunakan CSV atau pasang paket `xlsxwriter`.")
     st.success("Selesai.")
