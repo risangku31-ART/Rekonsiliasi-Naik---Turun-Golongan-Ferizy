@@ -1,10 +1,12 @@
 # app.py
-# Rekonsiliasi Naik/Turun Golongan — CSV & PASTE first, Excel optional bila engine tersedia
+# Rekonsiliasi Naik/Turun Golongan — CSV & PASTE, + fallback XLSX murni-Python (pure-xlsx)
 
 import csv
 import io
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 
 import streamlit as st
 
@@ -19,20 +21,18 @@ def has_module(name: str) -> bool:
 
 
 def available_reader_engines() -> List[str]:
-    # Hanya tampilkan engine jika pandas ada, karena read_excel butuh pandas.
-    if not has_module("pandas"):
-        return []
-    engines = []
-    if has_module("openpyxl"):
+    # 'pure-xlsx' selalu tersedia (untuk .xlsx). Engine lain butuh pandas.
+    engines = ["pure-xlsx"]
+    if has_module("pandas") and has_module("openpyxl"):
         engines.append("openpyxl")
-    if has_module("pandas_calamine"):
+    if has_module("pandas") and (has_module("pandas_calamine")):
         engines.append("calamine")
-    if has_module("xlrd"):
+    if has_module("pandas") and has_module("xlrd"):
         engines.append("xlrd")
     return engines
 
 
-# ----------------------------- Parsers -----------------------------
+# ----------------------------- CSV / PASTE Parsers -----------------------------
 def guess_delimiter(sample: str) -> str:
     if "\t" in sample:
         return "\t"
@@ -44,7 +44,6 @@ def guess_delimiter(sample: str) -> str:
 
 
 def read_csv_file(file) -> List[Dict[str, str]]:
-    """CSV robust (utf-8→cp1252 fallback)."""
     file.seek(0)
     data = file.read()
     if isinstance(data, bytes):
@@ -72,64 +71,154 @@ def read_paste(text: str) -> List[Dict[str, str]]:
         reader = csv.DictReader(io.StringIO(text), delimiter=delim)
         return [dict(r) for r in reader]
     except Exception:
-        try:
-            # Fallback engine=python autodetect
-            return [dict(r) for r in csv.DictReader(io.StringIO(text))]
-        except Exception:
-            st.error("Gagal mengurai data PASTE. Pastikan kolom dipisah TAB/;/,/|.")
-            return []
-
-
-def read_excel_rows(file, ext: str, forced_engine: str) -> List[Dict[str, str]]:
-    """
-    Baca Excel -> list of dicts. Butuh pandas + engine.
-    Kenapa: hindari crash jika dependency tidak ada; tampilkan warning & skip.
-    """
-    name = getattr(file, "name", "uploaded")
-    try:
-        import pandas as pd  # import lokal agar app tetap jalan tanpa pandas
-    except Exception:
-        st.warning(f"Lewati `{name}`: pandas tidak tersedia. Unggah CSV atau gunakan PASTE.")
         return []
 
-    def engine_ok(e: str) -> bool:
-        try:
-            __import__(e if e != "calamine" else "pandas_calamine")
-            return True
-        except Exception:
-            return False
 
+# ----------------------------- Minimal XLSX Reader (pure-Python) -----------------------------
+NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+}
+
+def _xlsx_col_to_idx(col: str) -> int:
+    n = 0
+    for ch in col:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return n - 1  # zero-based
+
+def _xlsx_ref_to_rc(ref: str) -> Tuple[int, int]:
+    # e.g. C5 -> (row=4, col=2) zero-based
+    m = re.match(r"([A-Z]+)(\d+)", ref)
+    if not m:
+        return 0, 0
+    col_letters, row_str = m.group(1), m.group(2)
+    return int(row_str) - 1, _xlsx_col_to_idx(col_letters)
+
+def _xlsx_read_shared_strings(z: ZipFile) -> List[str]:
+    sst = []
     try:
-        if forced_engine == "Auto":
-            if ext == ".xls":
-                if not engine_ok("xlrd"):
-                    raise RuntimeError("Butuh engine xlrd untuk .xls")
-                df = pd.read_excel(file, dtype=str, engine="xlrd")
-            else:
-                if engine_ok("openpyxl"):
-                    df = pd.read_excel(file, dtype=str, engine="openpyxl")
-                elif engine_ok("calamine"):
-                    df = pd.read_excel(file, dtype=str, engine="calamine")
-                else:
-                    raise RuntimeError("Tidak ada engine openpyxl/calamine")
+        with z.open("xl/sharedStrings.xml") as f:
+            tree = ET.parse(f)
+        for si in tree.getroot().iterfind(".//main:si", NS):
+            # collect all <t> inside si (handle rich text)
+            texts = []
+            for t in si.findall(".//main:t", NS):
+                texts.append(t.text or "")
+            sst.append("".join(texts))
+    except KeyError:
+        pass  # no sharedStrings
+    return sst
+
+def _xlsx_find_first_sheet_path(z: ZipFile) -> Optional[str]:
+    # Try common path first
+    if "xl/worksheets/sheet1.xml" in z.namelist():
+        return "xl/worksheets/sheet1.xml"
+    # Robust: read workbook + rels
+    try:
+        with z.open("xl/workbook.xml") as f:
+            wb = ET.parse(f).getroot()
+        first_sheet = wb.find(".//main:sheets/main:sheet", NS)
+        if first_sheet is None:
+            return None
+        rid = first_sheet.attrib.get(f"{{{NS['r']}}}id")
+        with z.open("xl/_rels/workbook.xml.rels") as f:
+            rels = ET.parse(f).getroot()
+        for rel in rels.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
+            if rel.attrib.get("Id") == rid:
+                target = rel.attrib.get("Target")  # e.g. worksheets/sheet1.xml
+                if not target:
+                    return None
+                path = "xl/" + target if not target.startswith("xl/") else target
+                return path
+    except KeyError:
+        return None
+    return None
+
+def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
+    z = ZipFile(io.BytesIO(bytes_data))
+    sst = _xlsx_read_shared_strings(z)
+    sheet_path = _xlsx_find_first_sheet_path(z)
+    if not sheet_path:
+        return []
+
+    with z.open(sheet_path) as f:
+        tree = ET.parse(f)
+    root = tree.getroot()
+
+    # Collect cells into a row-wise matrix
+    rows_dict: Dict[int, Dict[int, str]] = {}
+    max_col = -1
+    for c in root.findall(".//main:c", NS):
+        ref = c.attrib.get("r", "A1")
+        t = c.attrib.get("t")  # 's', 'inlineStr', 'b', 'str', etc.
+        v = c.find("main:v", NS)
+        is_node = c.find("main:is", NS)
+        text = ""
+        if t == "s":  # shared string
+            idx = int(v.text) if v is not None and v.text else -1
+            text = sst[idx] if 0 <= idx < len(sst) else ""
+        elif t == "inlineStr" and is_node is not None:
+            ts = [t.text or "" for t in is_node.findall(".//main:t", NS)]
+            text = "".join(ts)
+        elif t == "b":
+            text = "TRUE" if (v is not None and v.text == "1") else "FALSE"
         else:
-            if ext == ".xls" and forced_engine != "xlrd":
-                raise RuntimeError(f".xls hanya didukung xlrd, bukan {forced_engine}")
-            if ext in (".xlsx", ".xlsm") and forced_engine == "xlrd":
-                raise RuntimeError(".xlsx/.xlsm tidak didukung xlrd")
-            if forced_engine == "openpyxl" and not engine_ok("openpyxl"):
-                raise RuntimeError("engine openpyxl tidak tersedia")
-            if forced_engine == "calamine" and not engine_ok("calamine"):
-                raise RuntimeError("engine calamine tidak tersedia")
-            df = pd.read_excel(file, dtype=str, engine=("xlrd" if forced_engine == "xlrd" else forced_engine))
+            text = (v.text or "") if v is not None else ""  # number or plain
 
-        rows = df.fillna("").astype(str).to_dict(orient="records")
-        return rows
-    except Exception as e:
-        st.warning(f"Lewati `{name}`: {e}")
+        r, cidx = _xlsx_ref_to_rc(ref)
+        row_map = rows_dict.setdefault(r, {})
+        row_map[cidx] = text
+        max_col = max(max_col, cidx)
+
+    if not rows_dict:
         return []
 
+    # Build 2D rows ordered by row index
+    matrix: List[List[str]] = []
+    for r in sorted(rows_dict.keys()):
+        row = ["" for _ in range(max_col + 1)]
+        for cidx, val in rows_dict[r].items():
+            if 0 <= cidx <= max_col:
+                row[cidx] = val
+        matrix.append(row)
 
+    # First non-empty row as header
+    header: List[str] = []
+    data_start = 0
+    for i, row in enumerate(matrix):
+        if any(cell.strip() for cell in row):
+            header = row
+            data_start = i + 1
+            break
+    if not header:
+        return []
+
+    # Deduplicate empty/duplicate headers
+    norm = {}
+    final_header = []
+    for h in header:
+        base = (h or "").strip() or "COL"
+        name = base
+        k = 2
+        while name.lower() in norm:
+            name = f"{base}_{k}"
+            k += 1
+        norm[name.lower()] = True
+        final_header.append(name)
+
+    out: List[Dict[str, str]] = []
+    for row in matrix[data_start:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        rec = {}
+        for j, name in enumerate(final_header):
+            rec[name] = row[j] if j < len(row) else ""
+        out.append(rec)
+    return out
+
+
+# ----------------------------- Load Many -----------------------------
 def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]]:
     if not files:
         return []
@@ -140,15 +229,41 @@ def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]
         try:
             if low.endswith(".csv"):
                 rows = read_csv_file(f)
-            elif low.endswith((".xls", ".xlsx", ".xlsm")):
+            elif low.endswith((".xlsx", ".xlsm")):
                 if safe_mode:
                     st.warning(f"Lewati `{f.name}` (Excel) karena Safe Mode aktif. Unggah CSV atau matikan Safe Mode.")
-                    rows = []
                 else:
-                    ext = ".xls" if low.endswith(".xls") else (".xlsm" if low.endswith(".xlsm") else ".xlsx")
-                    rows = read_excel_rows(f, ext, forced_engine)
+                    # engine selection
+                    if forced_engine == "pure-xlsx" or (forced_engine == "Auto" and "pure-xlsx" in available_reader_engines()):
+                        f.seek(0)
+                        data = f.read()
+                        rows = read_xlsx_pure(data)
+                    else:
+                        # coba via pandas jika tersedia
+                        if not has_module("pandas"):
+                            st.warning(f"Lewati `{f.name}`: pandas tidak tersedia. Gunakan engine `pure-xlsx` atau unggah CSV.")
+                        else:
+                            import pandas as pd
+                            eng = None
+                            if forced_engine == "openpyxl" and has_module("openpyxl"):
+                                eng = "openpyxl"
+                            elif forced_engine == "calamine" and has_module("pandas_calamine"):
+                                eng = "calamine"
+                            elif forced_engine == "Auto":
+                                if has_module("openpyxl"):
+                                    eng = "openpyxl"
+                                elif has_module("pandas_calamine"):
+                                    eng = "calamine"
+                            if eng:
+                                f.seek(0)
+                                df = pd.read_excel(f, dtype=str, engine=eng)
+                                rows = df.fillna("").astype(str).to_dict(orient="records")
+                            else:
+                                st.warning(f"Lewati `{f.name}`: Tidak ada engine openpyxl/calamine. Pilih `pure-xlsx`.")
+            elif low.endswith(".xls"):
+                st.warning(f"Lewati `{f.name}` (.xls lama). Konversi ke CSV atau .xlsx.")
             else:
-                rows = read_csv_file(f)  # fallback
+                rows = read_csv_file(f)
         except Exception as e:
             st.warning(f"Lewati `{f.name}`: {e}")
             rows = []
@@ -258,31 +373,31 @@ st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 with st.expander("ℹ️ Mode & Engine", expanded=True):
     safe_mode = st.toggle(
         "Safe Mode (CSV & PASTE only) — aktifkan bila install dependencies gagal",
-        value=True,
-        help="Jika ON, file Excel di-skip. Matikan untuk coba proses Excel (butuh pandas + engine).",
+        value=False,
+        help="Jika ON, Excel di-skip. Matikan untuk memproses .xlsx (pure-xlsx) atau engine lain.",
     )
     avail = available_reader_engines()
     forced_engine = st.selectbox(
         "Paksa engine Excel",
         options=(["Auto"] + avail) if not safe_mode else ["Auto"],
         index=0,
-        help="Auto: .xls→xlrd, .xlsx/.xlsm→openpyxl lalu calamine.",
+        help="Auto: openpyxl→calamine→pure-xlsx untuk .xlsx; .xls disarankan konversi ke CSV/.xlsx.",
     )
-    st.write(f"**Status:** {'🟢 Safe Mode ON' if safe_mode else '🔵 Safe Mode OFF'}")
+    st.write(f"**Status:** {'🟢 Safe Mode ON' if safe_mode else '🔵 Safe Mode OFF'} — Engine tersedia: {', '.join(avail)}")
 
 with st.sidebar:
     st.header("1) Upload File (Multiple)")
     inv_files = st.file_uploader(
-        "📄 Invoice — CSV/XLS/XLSX/XLSM",
-        type=["csv", "xls", "xlsx", "xlsm"],
+        "📄 Invoice — CSV/XLSX/XLSM/XLS",
+        type=["csv", "xlsx", "xlsm", "xls"],
         accept_multiple_files=True,
     )
     tik_files = st.file_uploader(
-        "🎫 Tiket Summary — CSV/XLS/XLSX/XLSM",
-        type=["csv", "xls", "xlsx", "xlsm"],
+        "🎫 Tiket Summary — CSV/XLSX/XLSM/XLS",
+        type=["csv", "xlsx", "xlsm", "xls"],
         accept_multiple_files=True,
     )
-    st.caption("Excel akan di-skip jika Safe Mode ON atau engine tidak tersedia.")
+    st.caption("Jika tidak ada engine, pilih `pure-xlsx` untuk .xlsx; .xls lama akan di-skip.")
 
 st.subheader("Opsional: Tempel Data dari Excel")
 c1, c2 = st.columns(2)
@@ -292,12 +407,12 @@ with c2:
     paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV)", height=160, placeholder="Tempel data Tiket Summary di sini…")
 
 # Compose data
-rows_inv = []
+rows_inv: List[Dict[str, str]] = []
 rows_inv.extend(load_many(inv_files, safe_mode, forced_engine))
 for r in read_paste(paste_inv):
     r["Sumber File"] = "PASTE:Invoice"; rows_inv.append(r)
 
-rows_tik = []
+rows_tik: List[Dict[str, str]] = []
 rows_tik.extend(load_many(tik_files, safe_mode, forced_engine))
 for r in read_paste(paste_tik):
     r["Sumber File"] = "PASTE:TiketSummary"; rows_tik.append(r)
