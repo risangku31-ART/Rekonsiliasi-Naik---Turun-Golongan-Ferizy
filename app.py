@@ -1,5 +1,5 @@
 # app.py
-# Streamlit Rekonsiliasi Naik/Turun Golongan (Multi-file, Dependency Helper)
+# Streamlit Rekonsiliasi Naik/Turun Golongan (Multi-file, Excel reader fallback)
 
 from __future__ import annotations
 
@@ -15,32 +15,57 @@ import streamlit as st
 
 
 # ---------- Dependency helper ----------
+def has_module(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
+
+
+def available_excel_readers() -> List[str]:
+    readers = []
+    if has_module("openpyxl"):
+        readers.append("openpyxl")
+    if has_module("pandas_calamine") or has_module("calamine") or has_module("pandas_calamine.extensions"):
+        readers.append("calamine")
+    return readers
+
+
+def pick_excel_engine() -> str:
+    readers = available_excel_readers()
+    if "openpyxl" in readers:
+        return "openpyxl"
+    if "calamine" in readers:
+        return "calamine"
+    raise ImportError(
+        "Tidak ada engine pembaca Excel .xlsx/.xlsm. Pasang salah satu: "
+        "`openpyxl` atau `pandas-calamine` (engine='calamine')."
+    )
+
+
 def check_missing_deps() -> List[str]:
-    """Return missing Python packages needed for Excel IO."""
     missing = []
-    try:
-        import openpyxl  # noqa: F401
-    except Exception:
-        missing.append("openpyxl")
-    try:
-        import xlsxwriter  # noqa: F401
-    except Exception:
+    # Reader options: at least one of openpyxl/calamine
+    if not (has_module("openpyxl") or has_module("pandas_calamine")):
+        missing.append("openpyxl atau pandas-calamine")
+    # Writer
+    if not has_module("xlsxwriter"):
         missing.append("xlsxwriter")
-    try:
-        import xlrd  # noqa: F401
-    except Exception:
-        # optional (xls); include for completeness
-        missing.append("xlrd")
+    # Legacy .xls reader
+    if not has_module("xlrd"):
+        missing.append("xlrd (untuk .xls)")
     return missing
 
 
 def requirements_txt() -> str:
-    """Canonical requirements for this app."""
+    # Kedua opsi reader disertakan; cukup salah satunya terpasang agar bisa baca .xlsx
     return "\n".join(
         [
             "streamlit>=1.33",
-            "pandas>=2.0",
+            "pandas>=2.1",
             "openpyxl>=3.1.2",
+            "pandas-calamine>=0.2.0",
             "xlsxwriter>=3.1",
             "xlrd>=2.0.1",
             "",
@@ -49,7 +74,6 @@ def requirements_txt() -> str:
 
 
 def try_install(pkgs: List[str]) -> List[Tuple[str, bool, str]]:
-    """Attempt pip install at runtime. Not guaranteed in all environments."""
     results = []
     for pkg in pkgs:
         try:
@@ -71,26 +95,28 @@ def load_dataframe(file) -> pd.DataFrame:
         file.seek(0)
         if name.endswith(".csv"):
             return pd.read_csv(file, dtype=str, encoding_errors="ignore")
-        if name.endswith(".xlsx"):
-            # openpyxl is required; raise informative error if missing
-            try:
-                import openpyxl  # noqa: F401
-            except Exception as e:
-                raise ImportError(
-                    "File Excel .xlsx membutuhkan paket 'openpyxl'. "
-                    "Tambahkan ke requirements.txt atau instal dengan pip."
-                ) from e
-            return pd.read_excel(file, dtype=str, engine="openpyxl")
+
+        if name.endswith(".xlsx") or name.endswith(".xlsm"):
+            engine = pick_excel_engine()
+            return pd.read_excel(file, dtype=str, engine=engine)
+
         if name.endswith(".xls"):
-            # xlrd (>=2.0) mendukung .xls? Umumnya perlu 'xlrd<2' untuk xls lama.
-            # Tetap biarkan pandas memilih engine dan tangkap error jika perlu.
-            return pd.read_excel(file, dtype=str)
+            # Pandas butuh xlrd untuk .xls
+            if not has_module("xlrd"):
+                raise ImportError("File .xls membutuhkan paket 'xlrd'.")
+            return pd.read_excel(file, dtype=str, engine="xlrd")
+
         # default: coba CSV
         file.seek(0)
         return pd.read_csv(file, dtype=str, encoding_errors="ignore")
+
     except ImportError as e:
-        # Pesan yang spesifik dan ramah
         st.error(f"Gagal membaca file `{file.name}`: {e}")
+        st.info(
+            "Opsi solusi:\n"
+            "1) Install `openpyxl` **atau** `pandas-calamine` (untuk .xlsx/.xlsm), dan `xlrd` untuk .xls.\n"
+            "2) Konversi Excel ke CSV lalu upload."
+        )
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Gagal membaca file `{file.name}`: {e}")
@@ -98,7 +124,6 @@ def load_dataframe(file) -> pd.DataFrame:
 
 
 def load_many(files: Optional[List]) -> pd.DataFrame:
-    """Concatenate many uploaded files into one DataFrame; add 'Sumber File'."""
     if not files:
         return pd.DataFrame()
     frames: List[pd.DataFrame] = []
@@ -258,45 +283,49 @@ def display_table(df: pd.DataFrame) -> None:
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 
+readers = available_excel_readers()
 missing = check_missing_deps()
-with st.expander("ℹ️ Panduan dependency Excel", expanded=bool(missing)):
-    if missing:
-        st.error(
-            "Beberapa paket untuk Excel belum terpasang: **"
-            + ", ".join(missing)
-            + "**.\n\n"
-            "• Pilihan 1: Klik tombol **Install dependencies** (eksperimental; mungkin tidak didukung di semua environment).\n"
-            "• Pilihan 2: Tambahkan file `requirements.txt` berikut lalu jalankan ulang app."
-        )
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button(f"Install dependencies: {', '.join(missing)}"):
-                with st.spinner("Menginstal paket..."):
-                    results = try_install(missing)
-                msgs = [f"{p}: {'OK' if ok else 'GAGAL'}" for p, ok, _ in results]
-                st.write("\n".join(msgs))
-                st.caption("Jika instalasi berhasil, klik **Rerun** di atas atau refresh halaman.")
-        with colB:
-            st.download_button(
-                "Download requirements.txt",
-                data=requirements_txt().encode("utf-8"),
-                file_name="requirements.txt",
-                mime="text/plain",
-            )
-        st.caption("Alternatif cepat: konversi file Excel ke CSV lalu upload.")
+
+with st.expander("ℹ️ Status dependency Excel", expanded=not readers):
+    if readers:
+        st.success(f"Engine pembaca Excel terdeteksi: **{', '.join(readers)}**.")
     else:
-        st.success("Semua dependency Excel terdeteksi. Lanjutkan proses.")
+        st.error(
+            "Tidak ada engine untuk membaca .xlsx/.xlsm. Pasang **openpyxl** atau **pandas-calamine**.\n"
+            "Jika tidak memungkinkan, konversi file ke CSV."
+        )
+    if missing:
+        st.caption("Paket yang disarankan:")
+        st.code(requirements_txt(), language="text")
+        st.download_button(
+            "Download requirements.txt",
+            data=requirements_txt().encode("utf-8"),
+            file_name="requirements.txt",
+            mime="text/plain",
+        )
+        if st.button("Coba install otomatis (eksperimental)"):
+            pkgs = []
+            if not (has_module("openpyxl") or has_module("pandas_calamine")):
+                pkgs.extend(["openpyxl", "pandas-calamine"])
+            if not has_module("xlsxwriter"):
+                pkgs.append("xlsxwriter")
+            if not has_module("xlrd"):
+                pkgs.append("xlrd")
+            with st.spinner("Menginstal paket..."):
+                results = try_install(pkgs)
+            st.write("\n".join([f"{p}: {'OK' if ok else 'GAGAL'}" for p, ok, _ in results]))
+            st.caption("Jika berhasil, klik **Rerun** atau refresh halaman.")
 
 with st.sidebar:
     st.header("1) Upload File (Multiple)")
     f_inv_list = st.file_uploader(
-        "📄 File Invoice (CSV/XLSX) — bisa lebih dari satu",
-        type=["csv", "xlsx", "xls"],
+        "📄 File Invoice (CSV/XLSX/XLSM/XLS) — bisa lebih dari satu",
+        type=["csv", "xlsx", "xlsm", "xls"],
         accept_multiple_files=True,
     )
     f_tik_list = st.file_uploader(
-        "🎫 File Tiket Summary (CSV/XLSX) — bisa lebih dari satu",
-        type=["csv", "xlsx", "xls"],
+        "🎫 File Tiket Summary (CSV/XLSX/XLSM/XLS) — bisa lebih dari satu",
+        type=["csv", "xlsx", "xlsm", "xls"],
         accept_multiple_files=True,
     )
     st.caption("Jika ada beberapa Nomor Invoice di file apapun, nilai akan di-sum per Nomor Invoice.")
