@@ -1,6 +1,17 @@
-# app.py
-# Streamlit Rekonsiliasi Naik/Turun Golongan — Multi-file, CSV+XLS+XLSX, with Forced Engine Option
+# requirements.txt
+# versi dipin untuk mencegah gagal build di platform
+streamlit>=1.28,<1.40
+pandas>=2.1,<2.3
+openpyxl==3.1.5          # .xlsx reader (pure python)
+pandas-calamine==0.2.3   # alternatif reader .xlsx (wheel siap-pakai)
+xlsxwriter==3.2.0        # writer .xlsx
+xlrd==2.0.1              # .xls legacy
 
+# runtime.txt (opsional, jika platform mendukung - contoh: Streamlit Cloud)
+python-3.11
+
+# app.py
+# Rekonsiliasi Naik/Turun Golongan — Multi-file CSV+XLS+XLSX, dengan opsi paksa engine
 from __future__ import annotations
 
 import io
@@ -12,21 +23,13 @@ import pandas as pd
 import streamlit as st
 
 
-# ---------- Capability detection ----------
+# -------- deteksi modul (kenapa: untuk memilih engine yang tersedia) --------
 def has_module(name: str) -> bool:
     try:
         __import__(name)
         return True
     except Exception:
         return False
-
-
-def excel_reader_available() -> bool:
-    return has_module("openpyxl") or has_module("pandas_calamine") or has_module("xlrd")
-
-
-def excel_writer_available() -> bool:
-    return has_module("xlsxwriter")
 
 
 def available_reader_engines() -> List[str]:
@@ -40,16 +43,17 @@ def available_reader_engines() -> List[str]:
     return engines
 
 
+def excel_writer_available() -> bool:
+    return has_module("xlsxwriter")
+
+
 XLSX_WRITER_OK = excel_writer_available()
 
 
-# ---------- Loaders ----------
+# -------- loaders --------
 @st.cache_data(show_spinner=False)
 def load_dataframe(file, forced_engine: str) -> pd.DataFrame:
-    """
-    Load single file; use forced_engine if compatible, else skip with warning.
-    forced_engine in {"Auto", "openpyxl", "calamine", "xlrd"}.
-    """
+    """forced_engine: 'Auto'|'openpyxl'|'calamine'|'xlrd'."""
     if file is None:
         return pd.DataFrame()
     name = file.name
@@ -59,18 +63,17 @@ def load_dataframe(file, forced_engine: str) -> pd.DataFrame:
         if low.endswith(".csv"):
             return pd.read_csv(file, dtype=str, encoding_errors="ignore")
 
-        # Excel branches
         if low.endswith(".xls"):
-            # .xls only supported by xlrd
-            if forced_engine != "Auto" and forced_engine != "xlrd":
-                st.warning(f"Lewati `{name}`: format .xls membutuhkan engine `xlrd`, bukan `{forced_engine}`.")
+            # kenapa: .xls hanya didukung xlrd
+            if forced_engine not in ("Auto", "xlrd"):
+                st.warning(f"Lewati `{name}`: .xls memerlukan `xlrd`, bukan `{forced_engine}`.")
                 return pd.DataFrame()
             if not has_module("xlrd"):
                 st.warning(f"Lewati `{name}`: engine `xlrd` tidak tersedia. Konversi ke CSV.")
                 return pd.DataFrame()
             return pd.read_excel(file, dtype=str, engine="xlrd")
 
-        if low.endswith(".xlsx") or low.endswith(".xlsm"):
+        if low.endswith((".xlsx", ".xlsm")):
             if forced_engine == "Auto":
                 if has_module("openpyxl"):
                     return pd.read_excel(file, dtype=str, engine="openpyxl")
@@ -78,22 +81,21 @@ def load_dataframe(file, forced_engine: str) -> pd.DataFrame:
                     return pd.read_excel(file, dtype=str, engine="calamine")
                 st.warning(f"Lewati `{name}`: tidak ada engine `openpyxl`/`calamine`. Konversi ke CSV.")
                 return pd.DataFrame()
-            # Forced engine
             if forced_engine == "openpyxl":
                 if not has_module("openpyxl"):
-                    st.warning(f"Lewati `{name}`: engine `openpyxl` tidak tersedia.")
+                    st.warning(f"Lewati `{name}`: `openpyxl` tidak tersedia.")
                     return pd.DataFrame()
                 return pd.read_excel(file, dtype=str, engine="openpyxl")
             if forced_engine == "calamine":
                 if not has_module("pandas_calamine"):
-                    st.warning(f"Lewati `{name}`: engine `calamine` tidak tersedia.")
+                    st.warning(f"Lewati `{name}`: `calamine` tidak tersedia.")
                     return pd.DataFrame()
                 return pd.read_excel(file, dtype=str, engine="calamine")
             if forced_engine == "xlrd":
-                st.warning(f"Lewati `{name}`: `xlrd` tidak mendukung .xlsx/.xlsm. Pilih `openpyxl`/`calamine`.")
+                st.warning(f"Lewati `{name}`: `xlrd` tidak mendukung .xlsx/.xlsm.")
                 return pd.DataFrame()
 
-        # Fallback: coba CSV
+        # fallback
         return pd.read_csv(file, dtype=str, encoding_errors="ignore")
 
     except Exception as e:
@@ -138,7 +140,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
             return pd.DataFrame()
 
 
-# ---------- Helpers ----------
+# -------- helpers --------
 def guess_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
     cols = list(columns)
     norm = {c: normalize_colname(c) for c in cols}
@@ -278,7 +280,7 @@ def display_table(df: pd.DataFrame) -> None:
     st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-# ---------- UI ----------
+# -------- UI --------
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan")
 
@@ -287,12 +289,14 @@ with st.expander("ℹ️ Engine Excel"):
     if avail:
         st.success("Engine tersedia: " + ", ".join(avail))
     else:
-        st.error("Tidak ada engine Excel. File Excel akan di-skip. Gunakan CSV atau pasang engine.")
+        st.error(
+            "Tidak ada engine Excel. File Excel akan di-skip; unggah CSV atau pasang dependencies."
+        )
     forced_engine = st.selectbox(
-        "Paksa engine Excel (opsional)",
+        "Paksa engine Excel",
         options=["Auto"] + avail,
         index=0,
-        help="Auto: openpyxl → calamine untuk .xlsx/.xlsm; xlrd untuk .xls.",
+        help="Auto: .xlsx→openpyxl lalu calamine; .xls→xlrd.",
     )
 
 with st.sidebar:
@@ -312,11 +316,10 @@ with st.sidebar:
 st.subheader("Opsional: Tempel Data dari Excel")
 c1, c2 = st.columns(2)
 with c1:
-    paste_inv = st.text_area("PASTE — Invoice (TSV/CSV dari Excel)", height=160, placeholder="Tempel data Invoice di sini…")
+    paste_inv = st.text_area("PASTE — Invoice (TSV/CSV)", height=160, placeholder="Tempel data Invoice di sini…")
 with c2:
-    paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV dari Excel)", height=160, placeholder="Tempel data Tiket Summary di sini…")
+    paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV)", height=160, placeholder="Tempel data Tiket Summary di sini…")
 
-# Compose sources
 df_inv_files = load_many(f_inv_list, forced_engine)
 df_inv_paste = parse_pasted_table(paste_inv)
 if not df_inv_paste.empty:
@@ -329,7 +332,6 @@ if not df_tik_paste.empty:
     df_tik_paste["Sumber File"] = "PASTE:TiketSummary"
 df_tik = pd.concat([df_tik_files, df_tik_paste], ignore_index=True, sort=False)
 
-# Previews
 if not df_inv.empty:
     st.subheader(f"Preview: Invoice (gabungan {len(df_inv)} baris)")
     st.dataframe(df_inv.head(10), use_container_width=True, hide_index=True)
@@ -343,7 +345,6 @@ if df_inv.empty or df_tik.empty:
 
 st.divider()
 st.subheader("2) Pemetaan Kolom")
-
 invoice_key_guess = guess_column(
     df_inv.columns, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"]
 )
