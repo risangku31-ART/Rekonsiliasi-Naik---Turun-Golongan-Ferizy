@@ -1,5 +1,5 @@
 # app.py
-# Rekonsiliasi Naik/Turun Golongan — Pola SUMIFS (basis: Nomor Invoice dari uploader Invoice)
+# Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice) + kolom-kolom tambahan di hasil
 
 import csv
 import io
@@ -21,8 +21,7 @@ def has_module(name: str) -> bool:
 
 
 def available_reader_engines() -> List[str]:
-    # 'pure-xlsx' selalu tersedia untuk .xlsx; engine lain jika ada pandas/ekstensi.
-    engines = ["pure-xlsx"]
+    engines = ["pure-xlsx"]  # fallback .xlsx tanpa dependency
     if has_module("pandas") and has_module("openpyxl"):
         engines.append("openpyxl")
     if has_module("pandas") and has_module("pandas_calamine"):
@@ -166,7 +165,6 @@ def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
                 row[cidx] = val
         matrix.append(row)
 
-    # Header = baris non-kosong pertama
     header: List[str] = []
     data_start = 0
     for i, row in enumerate(matrix):
@@ -177,7 +175,6 @@ def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
     if not header:
         return []
 
-    # Pastikan header unik
     norm = {}
     final_header = []
     for h in header:
@@ -217,8 +214,7 @@ def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]
                     st.warning(f"Lewati `{f.name}` (Excel) karena Safe Mode aktif. Unggah CSV atau matikan Safe Mode.")
                 else:
                     if forced_engine == "pure-xlsx" or (forced_engine == "Auto" and "pure-xlsx" in available_reader_engines()):
-                        f.seek(0)
-                        data = f.read()
+                        f.seek(0); data = f.read()
                         rows = read_xlsx_pure(data)
                     else:
                         if not has_module("pandas"):
@@ -358,6 +354,40 @@ def ordered_keys(rows: List[Dict[str, str]], key_col: str) -> List[str]:
     return order
 
 
+def collect_first_map(rows: List[Dict[str, str]], key_col: str, val_col: Optional[str]) -> Dict[str, str]:
+    """Ambil nilai pertama non-kosong per key."""
+    if not val_col:
+        return {}
+    out: Dict[str, str] = {}
+    for r in rows:
+        k = coerce_invoice_key(r.get(key_col, ""))
+        v = (r.get(val_col, "") or "").strip()
+        if k and v and k not in out:
+            out[k] = v
+    return out
+
+
+def collect_unique_join_map(rows: List[Dict[str, str]], key_col: str, val_col: Optional[str], sep: str = ", ") -> Dict[str, str]:
+    """Gabung nilai unik (urutan kemunculan) per key."""
+    if not val_col:
+        return {}
+    out: Dict[str, str] = {}
+    seen_per_key: Dict[str, set] = {}
+    for r in rows:
+        k = coerce_invoice_key(r.get(key_col, ""))
+        v = (r.get(val_col, "") or "").strip()
+        if not k or not v:
+            continue
+        s = seen_per_key.setdefault(k, set())
+        if v not in s:
+            s.add(v)
+            if k in out:
+                out[k] = f"{out[k]}{sep}{v}"
+            else:
+                out[k] = v
+    return out
+
+
 # ----------------------------- UI -----------------------------
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan (SUMIFS)", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)")
@@ -421,36 +451,112 @@ if not rows_inv or not rows_tik:
     st.info("Unggah minimal satu file/PASTE untuk **Invoice** dan **Tiket Summary**.")
     st.stop()
 
-# Mapping
+# ----------------------------- Mapping -----------------------------
 st.divider()
 st.subheader("2) Pemetaan Kolom")
+
 inv_cols = union_columns(rows_inv); tik_cols = union_columns(rows_tik)
 
+# key & nominal
 inv_key_guess = guess_column(inv_cols, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"])
 inv_amt_guess = guess_column(inv_cols, ["harga", "nilai", "amount", "nominal", "total", "grand total"])
 tik_key_guess = guess_column(tik_cols, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"])
 tik_amt_guess = guess_column(tik_cols, ["tarif", "harga", "nilai", "amount", "nominal", "total", "grand total"])
 
-c3, c4 = st.columns(2)
-with c3:
-    st.markdown("**Invoice**")
+col_a, col_b = st.columns(2)
+with col_a:
+    st.markdown("**Invoice — kolom utama**")
     inv_key = st.selectbox("Kolom Nomor Invoice (Invoice)", inv_cols, index=inv_cols.index(inv_key_guess) if inv_key_guess in inv_cols else 0)
     inv_amt = st.selectbox("Kolom Nominal/Harga (Invoice)", inv_cols, index=inv_cols.index(inv_amt_guess) if inv_amt_guess in inv_cols else 0)
-with c4:
-    st.markdown("**Tiket Summary**")
-    tik_key = st.selectbox("Kolom Nomor Invoice (Tiket Summary)", tik_cols, index=tik_cols.index(tik_key_guess) if tik_key_guess in tik_cols else 0)
-    tik_amt = st.selectbox("Kolom Nominal/Tarif (Tiket Summary)", tik_cols, index=tik_cols.index(tik_amt_guess) if tik_amt_guess in tik_cols else 0)
+with col_b:
+    st.markdown("**Tiket Summary — kolom utama**")
+    tik_key = st.selectbox("Kolom Nomor Invoice (T-Summary)", tik_cols, index=tik_cols.index(tik_key_guess) if tik_key_guess in tik_cols else 0)
+    tik_amt = st.selectbox("Kolom Nominal/Tarif (T-Summary)", tik_cols, index=tik_cols.index(tik_amt_guess) if tik_amt_guess in tik_cols else 0)
 
-# SUMIFS (basis: uploader Invoice)
+st.markdown("**Pemetaan kolom tambahan (opsional, untuk ditampilkan di hasil):**")
+
+# Helper to create select with "— Kosong —"
+def select_with_empty(label: str, options: List[str], guess: Optional[str] = None):
+    opts = ["— Kosong —"] + options
+    idx = 0
+    if guess in options:
+        idx = options.index(guess) + 1
+    return st.selectbox(label, opts, index=idx)
+
+# Guesses
+inv_tgl_inv_guess = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "tanggal", "tgl"])
+inv_pay_inv_guess = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "pembayaran", "tgl pembayaran"])
+inv_keber_guess   = guess_column(inv_cols, ["keberangkatan", "asal", "origin", "berangkat"])
+inv_channel_guess = guess_column(inv_cols, ["channel"])
+inv_merchant_guess= guess_column(inv_cols, ["merchant", "mid", "acquirer"])
+
+ts_kode_booking_guess = guess_column(tik_cols, ["kode booking", "kode boking", "booking code"])
+ts_nomor_tiket_guess  = guess_column(tik_cols, ["nomor tiket", "no tiket", "ticket"])
+ts_pay_ts_guess       = guess_column(tik_cols, ["pembayaran", "tanggal pembayaran", "tgl bayar", "tgl pembayaran"])
+ts_golongan_guess     = guess_column(tik_cols, ["golongan", "kelas", "class"])
+ts_tujuan_guess       = guess_column(tik_cols, ["tujuan", "destination", "destinasi"])
+ts_cetak_bp_guess     = guess_column(tik_cols, ["cetak boarding pass", "tgl cetak", "boarding pass"])
+
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("**Tambahan dari Invoice**")
+    sel_inv_tgl_inv   = select_with_empty("Tanggal Invoice (Invoice)", inv_cols, inv_tgl_inv_guess)
+    sel_inv_pay_inv   = select_with_empty("Tanggal Pembayaran Invoice (kolom di Invoice)", inv_cols, inv_pay_inv_guess)
+    sel_inv_keber     = select_with_empty("Keberangkatan (Invoice)", inv_cols, inv_keber_guess)
+    sel_inv_channel   = select_with_empty("Channel (Invoice)", inv_cols, inv_channel_guess)
+    sel_inv_merchant  = select_with_empty("Merchant (Invoice)", inv_cols, inv_merchant_guess)
+
+with c2:
+    st.markdown("**Tambahan dari T-Summary**")
+    sel_ts_kode_bk    = select_with_empty("Kode Booking (T-Summary)", tik_cols, ts_kode_booking_guess)
+    sel_ts_no_tiket   = select_with_empty("Nomor Tiket (T-Summary)", tik_cols, ts_nomor_tiket_guess)
+    sel_ts_pay_ts     = select_with_empty("Tanggal Pembayaran T-Summary (kolom 'Pembayaran')", tik_cols, ts_pay_ts_guess)
+    sel_ts_golongan   = select_with_empty("Golongan (T-Summary)", tik_cols, ts_golongan_guess)
+    sel_ts_tujuan     = select_with_empty("Tujuan (T-Summary)", tik_cols, ts_tujuan_guess)
+    sel_ts_cetak_bp   = select_with_empty("Tgl Cetak Boarding Pass (T-Summary)", tik_cols, ts_cetak_bp_guess)
+
+# Convert selections to None if empty
+def none_if_empty(x: str) -> Optional[str]:
+    return None if x == "— Kosong —" else x
+
+inv_tgl_inv_col  = none_if_empty(sel_inv_tgl_inv)
+inv_pay_inv_col  = none_if_empty(sel_inv_pay_inv)
+inv_keber_col    = none_if_empty(sel_inv_keber)
+inv_channel_col  = none_if_empty(sel_inv_channel)
+inv_merchant_col = none_if_empty(sel_inv_merchant)
+
+ts_kode_bk_col   = none_if_empty(sel_ts_kode_bk)
+ts_no_tiket_col  = none_if_empty(sel_ts_no_tiket)
+ts_pay_ts_col    = none_if_empty(sel_ts_pay_ts)
+ts_gol_col       = none_if_empty(sel_ts_golongan)
+ts_tujuan_col    = none_if_empty(sel_ts_tujuan)
+ts_cetak_bp_col  = none_if_empty(sel_ts_cetak_bp)
+
+# ----------------------------- SUMIFS (basis Invoice) -----------------------------
 st.divider()
 st.subheader("3) Proses Rekonsiliasi — SUMIFS (Basis Invoice)")
 only_diff = st.checkbox("Hanya tampilkan yang berbeda (Selisih ≠ 0)", value=False)
 go = st.button("🚀 Proses")
 
 if go:
-    agg_inv = aggregate_sum(rows_inv, inv_key, inv_amt)   # SUMIFS sumber Invoice
-    agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)   # SUMIFS sumber Tiket Summary
-    keys_ordered = ordered_keys(rows_inv, inv_key)        # urutan sesuai kemunculan di uploader Invoice
+    # SUMIFS nominal
+    agg_inv = aggregate_sum(rows_inv, inv_key, inv_amt)
+    agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)
+    keys_ordered = ordered_keys(rows_inv, inv_key)
+
+    # Tambahan (maps)
+    inv_tgl_inv_map  = collect_first_map(rows_inv, inv_key, inv_tgl_inv_col)
+    inv_pay_inv_map  = collect_first_map(rows_inv, inv_key, inv_pay_inv_col)
+    inv_keber_map    = collect_first_map(rows_inv, inv_key, inv_keber_col)
+    inv_channel_map  = collect_first_map(rows_inv, inv_key, inv_channel_col)
+    inv_merchant_map = collect_first_map(rows_inv, inv_key, inv_merchant_col)
+
+    ts_kode_bk_map   = collect_unique_join_map(rows_tik, tik_key, ts_kode_bk_col)
+    ts_no_tiket_map  = collect_unique_join_map(rows_tik, tik_key, ts_no_tiket_col)
+    ts_pay_ts_map    = collect_first_map(rows_tik, tik_key, ts_pay_ts_col)
+    ts_gol_map       = collect_unique_join_map(rows_tik, tik_key, ts_gol_col)
+    ts_tujuan_map    = collect_unique_join_map(rows_tik, tik_key, ts_tujuan_col)
+    ts_cetak_bp_map  = collect_unique_join_map(rows_tik, tik_key, ts_cetak_bp_col)
 
     out_rows: List[Dict[str, str]] = []
     total_inv = total_tik = total_diff = 0.0
@@ -461,16 +567,31 @@ if go:
         v_tik = float(agg_tik.get(k, 0.0))
         diff = v_inv - v_tik
         cat = "Naik" if diff > 0 else ("Turun" if diff < 0 else "Sama")
+
+        row = {
+            # Kolom tambahan (kosong jika tidak dipetakan/ada)
+            "Tanggal Invoice":              inv_tgl_inv_map.get(k, ""),
+            "Kode Booking":                 ts_kode_bk_map.get(k, ""),
+            "Nomor Tiket":                  ts_no_tiket_map.get(k, ""),
+            "Tanggal Pembayaran Invoice":   inv_pay_inv_map.get(k, ""),
+            "Tanggal Pembayaran T-Summary": ts_pay_ts_map.get(k, ""),
+            "Golongan":                     ts_gol_map.get(k, ""),
+            "Keberangkatan":                inv_keber_map.get(k, ""),
+            "Tujuan":                       ts_tujuan_map.get(k, ""),
+            "Tgl Cetak Boarding Pass":      ts_cetak_bp_map.get(k, ""),
+            "Channel":                      inv_channel_map.get(k, ""),
+            "Merchant":                     inv_merchant_map.get(k, ""),
+            # Kunci & angka
+            "Nomor Invoice": k,
+            "Nominal Invoice (SUMIFS)": format_idr(v_inv),
+            "Nominal T-Summary (SUMIFS)": format_idr(v_tik),
+            "Selisih": format_idr(diff),
+            "Kategori": cat,
+        }
+
         if (not only_diff) or (diff != 0):
-            out_rows.append(
-                {
-                    "Nomor Invoice": k,
-                    "Nominal Invoice (SUMIFS)": format_idr(v_inv),
-                    "Nominal T-Summary (SUMIFS)": format_idr(v_tik),
-                    "Selisih": format_idr(diff),
-                    "Kategori": cat,
-                }
-            )
+            out_rows.append(row)
+
         total_inv += v_inv
         total_tik += v_tik
         total_diff += diff
@@ -480,7 +601,7 @@ if go:
 
     extra_tik_only = len(set(agg_tik.keys()) - set(keys_ordered))
     if extra_tik_only:
-        st.caption(f"ℹ️ {extra_tik_only} Nomor Invoice hanya ada di Tiket Summary (diabaikan — basis Invoice).")
+        st.caption(f"ℹ️ {extra_tik_only} Nomor Invoice hanya ada di T-Summary (diabaikan — basis Invoice).")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
@@ -491,10 +612,28 @@ if go:
     st.subheader("Hasil Rekonsiliasi (SUMIFS, Basis Invoice)")
     st.data_editor(out_rows, use_container_width=True, disabled=True, key="result")
 
-    # Download CSV
+    # Download CSV (urut kolom sesuai tampilan)
+    csv_cols = [
+        "Tanggal Invoice",
+        "Kode Booking",
+        "Nomor Tiket",
+        "Tanggal Pembayaran Invoice",
+        "Tanggal Pembayaran T-Summary",
+        "Golongan",
+        "Keberangkatan",
+        "Tujuan",
+        "Tgl Cetak Boarding Pass",
+        "Channel",
+        "Merchant",
+        "Nomor Invoice",
+        "Nominal Invoice (SUMIFS)",
+        "Nominal T-Summary (SUMIFS)",
+        "Selisih",
+        "Kategori",
+    ]
     si = io.StringIO()
     w = csv.writer(si)
-    w.writerow(["Nomor Invoice", "Nominal Invoice (SUMIFS)", "Nominal T-Summary (SUMIFS)", "Selisih", "Kategori"])
+    w.writerow(csv_cols)
     for r in out_rows:
-        w.writerow([r["Nomor Invoice"], r["Nominal Invoice (SUMIFS)"], r["Nominal T-Summary (SUMIFS)"], r["Selisih"], r["Kategori"]])
+        w.writerow([r.get(c, "") for c in csv_cols])
     st.download_button("⬇️ Download CSV", data=si.getvalue().encode("utf-8"), file_name="rekonsiliasi_sumifs_basis_invoice.csv", mime="text/csv")
