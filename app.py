@@ -1,5 +1,6 @@
-# app_ultra_safe_xlsb_gate.py
-# Rekonsiliasi Naik/Turun Golongan — ULTRA-SAFE + XLSB Gate (deteksi & opsi lewati)
+# app_fix_xlsb_autoskip.py
+# Rekonsiliasi Naik/Turun Golongan — AUTO-SKIP XLSB jika pyxlsb tidak ada
+# Fokus perbaikan: hilangkan blokir saat .xlsb hadir, lanjutkan proses file lain.
 
 import csv
 import io
@@ -11,10 +12,11 @@ from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import streamlit as st
 
-# ---------------- Page ----------------
-st.set_page_config(page_title="Rekonsiliasi ULTRA-SAFE (+XLSB Gate)", layout="wide")
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — ULTRA-SAFE (+ XLSB Gate)")
+# ========== PAGE CONFIG ==========
+st.set_page_config(page_title="Rekonsiliasi (Auto-skip XLSB)", layout="wide")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Auto-skip XLSB")
 
+# kecilkan metric (why: angka panjang)
 st.markdown("""
 <style>
 div[data-testid="stMetricLabel"] { font-size: 11px !important; }
@@ -23,7 +25,7 @@ div[data-testid="stMetricValue"] > div { white-space: nowrap !important; overflo
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Utils basic ----------------
+# ========== HELPERS ==========
 def guess_delimiter(sample: str) -> str:
     if "\t" in sample: return "\t"
     if sample.count(";") >= sample.count(",") and ";" in sample: return ";"
@@ -86,7 +88,7 @@ def pyxlsb_available() -> bool:
     except Exception:
         return False
 
-# ---------------- XLSX core (matrix) ----------------
+# ========== XLSX core (matrix) ==========
 NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
 
@@ -168,7 +170,7 @@ def xlsx_to_matrix(b: bytes) -> List[List[str]]:
         matrix.append(row)
     return matrix
 
-# ---------------- Header override ----------------
+# ========== Header override ==========
 def parse_header_override(s: str) -> List[str]:
     s = (s or "").strip()
     if not s: return []
@@ -177,7 +179,7 @@ def parse_header_override(s: str) -> List[str]:
     else: parts = [p.strip() for p in s.split(",")]
     return [p for p in parts if p != ""]
 
-# ---------------- Iterators (CSV/XLSX/XLSB/ZIP) ----------------
+# ========== Iterators (CSV/XLSX/XLSM/XLSB/ZIP) ==========
 def iter_csv_with_header(b: bytes, header_override: List[str], skip_rows_before_header: int) -> Generator[Dict[str, str], None, None]:
     delim = sniff_delimiter_from_bytes(b)
     tw = io.TextIOWrapper(io.BytesIO(b), encoding="utf-8", errors="ignore")
@@ -221,7 +223,7 @@ def iter_xlsb_with_header(name: str, b: bytes, header_override: List[str], skip_
     try:
         import pyxlsb  # type: ignore
     except Exception:
-        errors.append(f"{name}: membutuhkan paket 'pyxlsb'. Konversi ke CSV/XLSX atau pasang pyxlsb.")
+        errors.append(f"{name}: butuh paket 'pyxlsb'. Dilewati otomatis.")
         return
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
         try:
@@ -257,7 +259,9 @@ def iter_uploaded_file_rows(f, errors: List[str], header_override: List[str], sk
         elif name.endswith((".xlsx", ".xlsm")):
             f.seek(0); b = f.read(); yield from iter_xlsx_with_header(b, header_override, skip_rows_before_header)
         elif name.endswith(".xlsb"):
-            if not allow_xlsb: return
+            if not allow_xlsb: 
+                errors.append(f"{f.name}: .xlsb dilewati (pyxlsb tidak ada).")
+                return
             f.seek(0); b = f.read(); yield from iter_xlsb_with_header(f.name, b, header_override, skip_rows_before_header, errors)
         elif name.endswith(".zip"):
             f.seek(0); zb = io.BytesIO(f.read())
@@ -271,7 +275,10 @@ def iter_uploaded_file_rows(f, errors: List[str], header_override: List[str], sk
                             yield from iter_csv_with_header(data, header_override, skip_rows_before_header)
                         elif zname.endswith((".xlsx", ".xlsm")):
                             yield from iter_xlsx_with_header(data, header_override, skip_rows_before_header)
-                        elif zname.endswith(".xlsb") and allow_xlsb:
+                        elif zname.endswith(".xlsb"):
+                            if not allow_xlsb:
+                                errors.append(f"{zi.filename}: .xlsb dilewati (pyxlsb tidak ada).")
+                                continue
                             yield from iter_xlsb_with_header(zi.filename, data, header_override, skip_rows_before_header, errors)
                     except Exception as e:
                         errors.append(f"ZIP `{zi.filename}`: {e}")
@@ -280,7 +287,7 @@ def iter_uploaded_file_rows(f, errors: List[str], header_override: List[str], sk
     except Exception as e:
         errors.append(f"{f.name}: {e}")
 
-# ---------------- Header detection ----------------
+# ========== Header detection ==========
 def detect_headers(files: List, errors: List[str], header_override: List[str], skip_rows_before_header: int, allow_xlsb: bool) -> List[str]:
     if header_override: return header_override
     for f in files or []:
@@ -302,7 +309,10 @@ def detect_headers(files: List, errors: List[str], header_override: List[str], s
                 ne = [row for row in mat if any(str(x).strip() for x in row)]
                 if len(ne) > skip_rows_before_header:
                     return [str(x).strip() for x in ne[skip_rows_before_header]]
-            elif n.endswith(".xlsb") and allow_xlsb:
+            elif n.endswith(".xlsb"):
+                if not allow_xlsb: 
+                    errors.append(f"{f.name}: .xlsb dilewati (pyxlsb tidak ada).")
+                    continue
                 f.seek(0); b = f.read()
                 try:
                     import pyxlsb  # type: ignore
@@ -341,7 +351,10 @@ def detect_headers(files: List, errors: List[str], header_override: List[str], s
                                 ne = [row for row in mat if any(str(x).strip() for x in row)]
                                 if len(ne) > skip_rows_before_header:
                                     return [str(x).strip() for x in ne[skip_rows_before_header]]
-                            elif zname.endswith(".xlsb") and allow_xlsb:
+                            elif zname.endswith(".xlsb"):
+                                if not allow_xlsb:
+                                    errors.append(f"{zi.filename}: .xlsb dilewati (pyxlsb tidak ada).")
+                                    continue
                                 try:
                                     import pyxlsb  # type: ignore
                                     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
@@ -363,7 +376,26 @@ def detect_headers(files: List, errors: List[str], header_override: List[str], s
             errors.append(f"Header `{f.name}`: {e}")
     return []
 
-# ---------------- XLSX writer (download) ----------------
+# ========== XLSB discovery (for message) ==========
+def list_xlsb(files: List) -> List[str]:
+    out = []
+    for f in files or []:
+        n = (f.name or "").lower()
+        if n.endswith(".xlsb"):
+            out.append(f.name)
+        elif n.endswith(".zip"):
+            try:
+                f.seek(0); zb = io.BytesIO(f.read())
+                with ZipFile(zb) as z:
+                    for zi in z.infolist():
+                        if zi.is_dir(): continue
+                        if zi.filename.lower().endswith(".xlsb"):
+                            out.append(f"{f.name} -> {zi.filename}")
+            except Exception:
+                pass
+    return out
+
+# ========== XLSX writer (download) ==========
 def _col_letters(idx: int) -> str:
     s = ""; idx += 1
     while idx: idx, r = divmod(idx - 1, 26); s = chr(65 + r) + s
@@ -383,7 +415,7 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="
     for row in rows:
         r += 1
         ws.append(f'<row r="{r}">' + "".join(
-            f'<c r="{_col_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(row.get(c,'') or ''))}</t></is></c>'
+            f'<c r="{_col_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(row.get(c,"") or ""))}</t></is></c>'
             for i, c in enumerate(columns)) + "</row>")
     ws.append("</sheetData></worksheet>")
     sheet_xml = "\n".join(ws).encode("utf-8")
@@ -423,7 +455,7 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="
         z.writestr("xl/styles.xml", styles)
     return bio.getvalue()
 
-# ---------------- UI: Uploaders ----------------
+# ========== UI Upload ==========
 with st.sidebar:
     st.header("1) Upload (CSV / XLSX / XLSM / XLSB / ZIP) — multiple")
     inv_files = st.file_uploader("📄 Invoice", type=["csv","xlsx","xlsm","xlsb","zip"], accept_multiple_files=True)
@@ -442,44 +474,23 @@ if not inv_files or not ts_files:
     st.info("Unggah minimal satu file untuk **Invoice** dan **T-Summary**.")
     st.stop()
 
-# ---------------- XLSB Gate ----------------
-def zip_has_xlsb(f) -> bool:
-    try:
-        if not (f.name or "").lower().endswith(".zip"): return False
-        f.seek(0); zb = io.BytesIO(f.read())
-        with ZipFile(zb) as z:
-            return any((zi.filename.lower().endswith(".xlsb") for zi in z.infolist() if not zi.is_dir()))
-    except Exception:
-        return False
-
-def any_xlsb(files: List) -> bool:
-    for f in files:
-        n = (f.name or "").lower()
-        if n.endswith(".xlsb"): return True
-        if n.endswith(".zip") and zip_has_xlsb(f): return True
-    return False
-
-xlsb_present = any_xlsb(inv_files) or any_xlsb(ts_files)
+# ========== XLSB availability & info ==========
 xlsb_ok = pyxlsb_available()
-
-if xlsb_present and not xlsb_ok:
-    st.warning("ZIP bisa berisi CSV/XLSX/XLSM/XLSB. **pyxlsb TIDAK ada** — berkas **.xlsb akan dilewati** secara default.")
-    skip_xlsb = st.toggle("Lewati .xlsb dan lanjutkan proses", value=True)
-    req_txt = "streamlit>=1.26\npyxlsb>=1.0.10\n"
-    st.download_button("⬇️ Download requirements.txt (untuk mengaktifkan .xlsb)", req_txt.encode("utf-8"),
+xlsb_list = list_xlsb(inv_files) + list_xlsb(ts_files)
+if xlsb_list and not xlsb_ok:
+    st.warning("pyxlsb **tidak** tersedia — berkas **.xlsb akan dilewati otomatis**. Daftar yang dilewati:")
+    with st.expander("Lihat daftar .xlsb yang dilewati", expanded=False):
+        for s in xlsb_list:
+            st.caption(f"– {s}")
+    st.download_button("⬇️ Download requirements.txt (aktifkan .xlsb)", data=b"streamlit>=1.26\npyxlsb>=1.0.10\n",
                        file_name="requirements.txt", mime="text/plain")
-    st.caption("Alternatif cepat: buka di Excel → **Save As** CSV/XLSX, lalu upload ulang.")
-    if not skip_xlsb:
-        st.error("pyxlsb belum tersedia dan Anda memilih untuk **tidak** melewati .xlsb. Pasang pyxlsb atau konversi file, lalu jalankan lagi.")
-        st.stop()
-else:
-    skip_xlsb = not xlsb_ok  # jika pyxlsb ada → False (boleh baca xlsb); kalau tidak ada & tak ada xlsb, nilai ini tidak berpengaruh
+allow_xlsb = xlsb_ok  # auto (no toggle)
 
-# ---------------- Header mapping ----------------
+# ========== Header mapping ==========
 errors: List[str] = []
 try:
-    inv_headers = detect_headers(inv_files, errors, inv_hdr_manual, inv_skip, allow_xlsb=not skip_xlsb)
-    ts_headers  = detect_headers(ts_files,  errors, ts_hdr_manual,  ts_skip, allow_xlsb=not skip_xlsb)
+    inv_headers = detect_headers(inv_files, errors, inv_hdr_manual, inv_skip, allow_xlsb=allow_xlsb)
+    ts_headers  = detect_headers(ts_files,  errors, ts_hdr_manual,  ts_skip, allow_xlsb=allow_xlsb)
     if not inv_headers: st.error("Tidak bisa mendeteksi header dari Invoice. Atur **Lewati baris** atau isi **Paksa header manual**."); st.stop()
     if not ts_headers:  st.error("Tidak bisa mendeteksi header dari T-Summary. Atur **Lewati baris** atau isi **Paksa header manual**."); st.stop()
 except Exception:
@@ -511,7 +522,7 @@ only_diff  = st.checkbox("Hanya Selisih ≠ 0", value=False)
 show_table = st.checkbox("Tampilkan Tabel (opsional)", value=False)
 go = st.button("🚀 Proses")
 
-# ---------------- Proses ----------------
+# ========== Proses ==========
 def add_join(store: Dict[str, set], k: str, v: str):
     if not v: return
     store.setdefault(k, set()).add(v)
@@ -531,7 +542,7 @@ if go:
         ts_join   = {"kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}
 
         # Invoice
-        for row in iter_all(inv_files, inv_hdr_manual, inv_skip, allow_xlsb=not skip_xlsb):
+        for row in iter_all(inv_files, inv_hdr_manual, inv_skip, allow_xlsb=allow_xlsb):
             key = coerce_key(row.get(inv_key, ""))
             if not key: continue
             if key not in seen:
@@ -544,7 +555,7 @@ if go:
             if key not in inv_first["merchant"]and row.get(inv_merchant, ""):inv_first["merchant"][key]= row.get(inv_merchant, "")
 
         # T-Summary
-        for row in iter_all(ts_files, ts_hdr_manual, ts_skip, allow_xlsb=not skip_xlsb):
+        for row in iter_all(ts_files, ts_hdr_manual, ts_skip, allow_xlsb=allow_xlsb):
             key = coerce_key(row.get(ts_key, ""))
             if not key: continue
             agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(row.get(ts_amt, "0"))
@@ -607,7 +618,7 @@ if go:
 
         xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
         st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_bytes,
-                           file_name="rekonsiliasi_ultra_safe_xlsb_gate.xlsx",
+                           file_name="rekonsiliasi_autoskip_xlsb.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         if errors:
