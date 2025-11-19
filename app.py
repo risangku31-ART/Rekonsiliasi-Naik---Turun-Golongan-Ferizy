@@ -1,28 +1,30 @@
-# file: app_xlsb_only.py
-# Rekonsiliasi Naik/Turun Golongan — Uploader HANYA .xlsb
+# file: app_xlsb_only_auto_header.py
+# Rekonsiliasi Naik/Turun Golongan — .xlsb only + auto header + sheet picker + export XLSX
+# Requirements minimal:
+#   streamlit>=1.26
+#   pyxlsb>=1.0.10
 
 import io
 import re
-import csv
 import tempfile
-from zipfile import ZipFile  # (tidak dipakai, tapi dibiarkan untuk mudah extend)
-from typing import Dict, List, Generator, Tuple
+import traceback
+from typing import Dict, List, Tuple, Optional
 import streamlit as st
 
-# ---------------- Config UI ----------------
-st.set_page_config(page_title="Rekonsiliasi (.xlsb only)", layout="wide")
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb only)")
+# ---------- Page ----------
+st.set_page_config(page_title="Rekonsiliasi (.xlsb only + Auto Header)", layout="wide")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb only + Auto Header)")
 
-# kecilkan metric (why: angka panjang)
 st.markdown("""
 <style>
 div[data-testid="stMetricLabel"] { font-size: 11px !important; }
 div[data-testid="stMetricValue"] { font-size: 17px !important; }
 div[data-testid="stMetricValue"] > div { white-space: nowrap !important; overflow: visible !important; text-overflow: clip !important; }
+.small-note { font-size: 12px; opacity: .8 }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Utils ----------------
+# ---------- Utils ----------
 def pyxlsb_available() -> bool:
     try:
         import pyxlsb  # noqa
@@ -75,83 +77,96 @@ def pick_guess(headers: List[str], candidates: List[str]) -> str:
             if n == c or c in n: return h
     return headers[0]
 
-def parse_header_override(s: str) -> List[str]:
-    s = (s or "").strip()
-    if not s: return []
-    if "\t" in s: parts = [p.strip() for p in s.split("\t")]
-    elif ";" in s: parts = [p.strip() for p in s.split(";")]
-    else: parts = [p.strip() for p in s.split(",")]
-    return [p for p in parts if p != ""]
+# ---------- XLSB Reader + Auto Header ----------
+class SheetMode:
+    AUTO = "Auto (sheet pertama berisi data)"
+    BY_NAME = "Nama sheet"
+    BY_INDEX = "Index (1-based)"
 
-# ---------------- XLSB Reader ----------------
-def _xlsb_first_nonempty_sheet_rows(name: str, b: bytes) -> List[List[str]]:
-    """Cari sheet pertama yang berisi data (why: beberapa file header ada di sheet selain index 1)."""
+def _xlsb_rows_from_sheet_bytes(b: bytes, sheet_mode: str,
+                                sheet_name: Optional[str],
+                                sheet_index: Optional[int]) -> List[List[str]]:
+    """Baca semua baris non-kosong dari sheet terpilih."""
     try:
         import pyxlsb  # type: ignore
     except Exception:
         return []
-    rows_nonempty: List[List[str]] = []
+    rows: List[List[str]] = []
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
         tmp.write(b); tmp.flush()
         import pyxlsb  # type: ignore
         with pyxlsb.open_workbook(tmp.name) as wb:
-            sheet_names = getattr(wb, "sheets", None) or []
-            for sname in sheet_names or [1]:
-                try:
-                    with wb.get_sheet(sname) as sh:
-                        tmp_rows = []
-                        for r in sh.rows():
-                            vals = [(c.v if c is not None else "") for c in r]
-                            if any(str(x).strip() for x in vals):
-                                tmp_rows.append([str(x or "") for x in vals])
+            def read_sheet(sh) -> List[List[str]]:
+                out = []
+                with wb.get_sheet(sh) as sheet:
+                    for r in sheet.rows():
+                        vals = [(c.v if c is not None else "") for c in r]
+                        if any(str(x).strip() for x in vals):
+                            out.append([str(x or "") for x in vals])
+                return out
+
+            if sheet_mode == SheetMode.BY_NAME and sheet_name:
+                try: rows = read_sheet(sheet_name)
+                except Exception: rows = []
+            elif sheet_mode == SheetMode.BY_INDEX and sheet_index and sheet_index > 0:
+                try: rows = read_sheet(sheet_index)
+                except Exception: rows = []
+            else:
+                for i in range(1, 41):
+                    try:
+                        tmp_rows = read_sheet(i)
                         if tmp_rows:
-                            rows_nonempty = tmp_rows
-                            break
-                except Exception:
-                    continue
-    return rows_nonempty
+                            rows = tmp_rows; break
+                    except Exception:
+                        continue
+    return rows
 
-def iter_xlsb_with_header(name: str, b: bytes, header_override: List[str], skip_rows_before_header: int, errors: List[str]) -> Generator[Dict[str, str], None, None]:
-    if not pyxlsb_available():
-        errors.append(f"{name}: pyxlsb tidak tersedia.")
-        return
-    ne_rows = _xlsb_first_nonempty_sheet_rows(name, b)
-    if not ne_rows or len(ne_rows) <= skip_rows_before_header:
-        errors.append(f"{name}: tidak ada baris data terdeteksi.")
-        return
-    if header_override:
-        header = header_override
-        data_rows = ne_rows[skip_rows_before_header:]
-    else:
-        header = [str(x).strip() for x in ne_rows[skip_rows_before_header]]
-        data_rows = ne_rows[skip_rows_before_header + 1:]
-    maxw = max(len(header), max((len(r) for r in data_rows), default=0))
-    header = header + [f"COL{j+1}" for j in range(len(header), maxw)]
-    for r in data_rows:
-        r = list(r) + [""] * (maxw - len(r))
-        yield {header[j]: r[j] for j in range(maxw)}
+def _is_numeric_like(val: str) -> bool:
+    return bool(re.fullmatch(r"\s*[\d\.\,\-\(\)]+\s*", str(val or "")))
 
-def detect_headers_xlsb(files: List, header_override: List[str], skip_rows_before_header: int, errors: List[str]) -> List[str]:
-    if header_override: return header_override
-    for f in files or []:
-        try:
-            f.seek(0); b = f.read()
-            ne = _xlsb_first_nonempty_sheet_rows(f.name, b)
-            if len(ne) > skip_rows_before_header:
-                return [str(x).strip() for x in ne[skip_rows_before_header]]
-        except Exception as e:
-            errors.append(f"Header {f.name}: {e}")
-    return []
+def _infer_header_and_records(ne_rows: List[List[str]]) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Auto header: pilih baris pertama yang tidak numeric-heavy; fallback ke baris non-kosong pertama."""
+    if not ne_rows: return [], []
+    header_idx = 0
+    for i, row in enumerate(ne_rows):
+        nonempty = [c for c in row if str(c).strip() != ""]
+        if len(nonempty) < 2:  # sangat kecil, loncati
+            continue
+        nums = sum(1 for c in nonempty if _is_numeric_like(c))
+        if nums <= len(nonempty) // 2:  # mayoritas bukan angka -> kandidat header
+            header_idx = i
+            break
+    header_raw = ne_rows[header_idx]
+    header = [str(x).strip() or f"COL{j+1}" for j, x in enumerate(header_raw)]
+    # pastikan unik
+    seen: Dict[str, int] = {}
+    cols: List[str] = []
+    for h in header:
+        key = h or "COL"
+        seen[key] = seen.get(key, 0) + 1
+        cols.append(key if seen[key] == 1 else f"{key}_{seen[key]}")
 
-def iter_uploaded_xlsb_rows(f, errors: List[str], header_override: List[str], skip_rows_before_header: int) -> Generator[Dict[str, str], None, None]:
-    name = (f.name or "")
+    records: List[Dict[str, str]] = []
+    for r in ne_rows[header_idx + 1:]:
+        if not any(str(x).strip() for x in r):
+            continue
+        row = [str(x or "") for x in r] + [""] * (len(cols) - len(r))
+        records.append({cols[j]: row[j] for j in range(len(cols))})
+    return cols, records
+
+def read_xlsb_records(f, sheet_mode: str, sheet_name: Optional[str], sheet_index: Optional[int], errors: List[str]) -> Tuple[List[str], List[Dict[str, str]]]:
     try:
         f.seek(0); b = f.read()
-        yield from iter_xlsb_with_header(name, b, header_override, skip_rows_before_header, errors)
+        ne_rows = _xlsb_rows_from_sheet_bytes(b, sheet_mode, sheet_name, sheet_index)
+        if not ne_rows:
+            errors.append(f"{f.name}: sheet kosong / tidak terbaca.")
+            return [], []
+        return _infer_header_and_records(ne_rows)
     except Exception as e:
-        errors.append(f"{name}: {e}")
+        errors.append(f"{f.name}: {e}")
+        return [], []
 
-# ---------------- XLSX Writer (Export) ----------------
+# ---------- XLSX Writer (Download) ----------
 def _col_letters(idx: int) -> str:
     s = ""; idx += 1
     while idx: idx, r = divmod(idx - 1, 26); s = chr(65 + r) + s
@@ -212,25 +227,34 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="
         z.writestr("xl/styles.xml", styles)
     return bio.getvalue()
 
-# ---------------- Uploaders (HANYA .xlsb) ----------------
+# ---------- Uploaders (HANYA .xlsb) ----------
 with st.sidebar:
     st.header("1) Upload (.xlsb) — multiple")
     inv_files = st.file_uploader("📄 Invoice (.xlsb)", type=["xlsb"], accept_multiple_files=True)
     ts_files  = st.file_uploader("🎫 T-Summary (.xlsb)", type=["xlsb"], accept_multiple_files=True)
 
-st.subheader("2) Pengaturan Header")
-c1, c2 = st.columns(2)
-with c1:
-    inv_skip = st.number_input("Lewati baris awal (Invoice)", min_value=0, value=0, step=1)
-    inv_hdr_manual = parse_header_override(st.text_input("Paksa header manual (Invoice)", value=""))
-with c2:
-    ts_skip = st.number_input("Lewati baris awal (T-Summary)", min_value=0, value=0, step=1)
-    ts_hdr_manual = parse_header_override(st.text_input("Paksa header manual (T-Summary)", value=""))
+# ---------- Sheet Settings ----------
+class _SM:  # kecilkan namespace di widget
+    AUTO = SheetMode.AUTO
+    NAME = SheetMode.BY_NAME
+    IDX  = SheetMode.BY_INDEX
 
-# Hard guard: pyxlsb wajib ada
+st.subheader("2) Pengaturan Sheet")
+csm1, csm2 = st.columns(2)
+with csm1:
+    inv_sheet_mode = st.selectbox("Mode Sheet (Invoice)", [_SM.AUTO, _SM.NAME, _SM.IDX], index=0)
+    inv_sheet_name = st.text_input("Nama Sheet (Invoice)", value="") if inv_sheet_mode == _SM.NAME else ""
+    inv_sheet_idx  = st.number_input("Index Sheet (Invoice)", min_value=1, value=1, step=1) if inv_sheet_mode == _SM.IDX else None
+with csm2:
+    ts_sheet_mode  = st.selectbox("Mode Sheet (T-Summary)", [_SM.AUTO, _SM.NAME, _SM.IDX], index=0)
+    ts_sheet_name  = st.text_input("Nama Sheet (T-Summary)", value="") if ts_sheet_mode == _SM.NAME else ""
+    ts_sheet_idx   = st.number_input("Index Sheet (T-Summary)", min_value=1, value=1, step=1) if ts_sheet_mode == _SM.IDX else None
+
+# ---------- Guard: pyxlsb must exist ----------
 if not pyxlsb_available():
-    st.error("pyxlsb belum terpasang. Tambahkan ke requirements.txt:\n\n`streamlit>=1.26\\npyxlsb>=1.0.10`")
-    st.download_button("⬇️ Download requirements.txt", data=b"streamlit>=1.26\npyxlsb>=1.0.10\n",
+    st.error("`pyxlsb` belum terpasang. Tambahkan ke `requirements.txt`:\n\n```\nstreamlit>=1.26\npyxlsb>=1.0.10\n```")
+    st.download_button("⬇️ Download requirements.txt",
+                       data=b"streamlit>=1.26\npyxlsb>=1.0.10\n",
                        file_name="requirements.txt", mime="text/plain")
     st.stop()
 
@@ -238,19 +262,25 @@ if not inv_files or not ts_files:
     st.info("Unggah minimal satu file **Invoice (.xlsb)** dan satu file **T-Summary (.xlsb)**.")
     st.stop()
 
-# ---------------- Header detection (xlsb only) ----------------
+# ---------- Header Detection (AUTO) ----------
 errors: List[str] = []
-inv_headers = detect_headers_xlsb(inv_files, inv_hdr_manual, inv_skip, errors)
-ts_headers  = detect_headers_xlsb(ts_files,  ts_hdr_manual,  ts_skip,  errors)
+def detect_headers(files, sheet_mode, sheet_name, sheet_index) -> List[str]:
+    for f in files or []:
+        hdr, _ = read_xlsb_records(f, sheet_mode, sheet_name, sheet_index, errors)
+        if hdr: return hdr
+    return []
+
+inv_headers = detect_headers(inv_files, inv_sheet_mode, inv_sheet_name, inv_sheet_idx)
+ts_headers  = detect_headers(ts_files,  ts_sheet_mode,  ts_sheet_name,  ts_sheet_idx)
 
 if not inv_headers:
-    st.error("Tidak bisa mendeteksi header dari Invoice (.xlsb). Atur **Lewati baris** atau isi **Paksa header manual**.")
+    st.error("Tidak bisa mendeteksi header dari Invoice (.xlsb). Periksa pilihan sheet.")
     st.stop()
 if not ts_headers:
-    st.error("Tidak bisa mendeteksi header dari T-Summary (.xlsb). Atur **Lewati baris** atau isi **Paksa header manual**.")
+    st.error("Tidak bisa mendeteksi header dari T-Summary (.xlsb). Periksa pilihan sheet.")
     st.stop()
 
-# ---------------- Mapping ----------------
+# ---------- Mapping ----------
 st.subheader("3) Pemetaan Kolom")
 c3, c4 = st.columns(2)
 with c3:
@@ -273,21 +303,32 @@ with c4:
     ts_asal  = st.selectbox("Keberangkatan / Asal", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["asal","keberangkatan"])) if ts_headers else 0)
     ts_cetak = st.selectbox("Tgl Cetak Boarding Pass", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["cetak boarding pass","tgl cetak"])) if ts_headers else 0)
 
-only_diff  = st.checkbox("Hanya Selisih ≠ 0", value=False)
-show_table = st.checkbox("Tampilkan tabel hasil", value=False)
+# ---------- Opsi Hasil ----------
+copt1, copt2 = st.columns(2)
+with copt1:
+    only_diff  = st.checkbox("Hanya Selisih ≠ 0", value=False)
+with copt2:
+    tol = st.number_input("Toleransi selisih (Rp)", min_value=0.0, value=0.0, step=1000.0, format="%.0f")
+
 go = st.button("🚀 Proses")
 
-# ---------------- Proses ----------------
+# ---------- Proses ----------
 def add_join(store: Dict[str, set], k: str, v: str):
     if not v: return
     store.setdefault(k, set()).add(v)
 
-def iter_all(files, hdr_override, skip_before):
+def read_all(files, sheet_mode, sheet_name, sheet_index) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
     for f in files:
-        yield from iter_uploaded_xlsb_rows(f, errors, hdr_override, skip_before)
+        hdr, recs = read_xlsb_records(f, sheet_mode, sheet_name, sheet_index, errors)
+        out.extend(recs)
+    return out
 
 if go:
     try:
+        inv_recs = read_all(inv_files, inv_sheet_mode, inv_sheet_name, inv_sheet_idx)
+        ts_recs  = read_all(ts_files,  ts_sheet_mode,  ts_sheet_name,  ts_sheet_idx)
+
         agg_inv: Dict[str, float] = {}
         agg_ts:  Dict[str, float] = {}
         keys_order: List[str] = []; seen = set()
@@ -296,12 +337,11 @@ if go:
         ts_first  = {"pay_ts": {}}
         ts_join   = {"kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}
 
-        # Invoice
-        for row in iter_all(inv_files, inv_hdr_manual, inv_skip):
+        # Invoice basis (patokan awal)
+        for row in inv_recs:
             key = coerce_key(row.get(inv_key, ""))
             if not key: continue
-            if key not in seen:
-                seen.add(key); keys_order.append(key)
+            if key not in seen: seen.add(key); keys_order.append(key)
             agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(row.get(inv_amt, "0"))
             if key not in inv_first["tgl_inv"] and row.get(inv_tgl_inv, ""): inv_first["tgl_inv"][key] = row.get(inv_tgl_inv, "")
             if key not in inv_first["pay_inv"] and row.get(inv_pay_inv, ""): inv_first["pay_inv"][key] = row.get(inv_pay_inv, "")
@@ -310,7 +350,7 @@ if go:
             if key not in inv_first["merchant"]and row.get(inv_merchant, ""):inv_first["merchant"][key]= row.get(inv_merchant, "")
 
         # T-Summary
-        for row in iter_all(ts_files, ts_hdr_manual, ts_skip):
+        for row in ts_recs:
             key = coerce_key(row.get(ts_key, ""))
             if not key: continue
             agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(row.get(ts_amt, "0"))
@@ -331,15 +371,19 @@ if go:
             v_ts  = float(agg_ts.get(k, 0.0))
             diff = v_inv - v_ts
             cat = "Turun" if v_inv > v_ts else ("Naik" if v_inv < v_ts else "Sama")
+
+            if only_diff and diff == 0: 
+                continue
+            if tol > 0 and abs(diff) <= tol:
+                continue
+
             row = {
                 "Tanggal Invoice":              inv_first["tgl_inv"].get(k, ""),
                 "Nomor Invoice":                k,
                 "Kode Booking":                 ", ".join(sorted(ts_join["kode"].get(k, []))),
                 "Nomor Tiket":                  ", ".join(sorted(ts_join["tiket"].get(k, []))),
-                "Nominal Invoice (SUMIFS)":     format_idr(v_inv),
-                "Tanggal Pembayaran Invoice":   inv_first["pay_inv"].get(k, ""),
-                "Nominal T-Summary (SUMIFS)":   format_idr(v_ts),
-                "Tanggal Pembayaran T-Summary": ts_first["pay_ts"].get(k, ""),
+                "Invoice (Nominal; Tgl Bayar)": f"{format_idr(v_inv)}; {inv_first['pay_inv'].get(k, '')}",
+                "T-Summary (Nominal; Tgl Bayar)": f"{format_idr(v_ts)}; {ts_first['pay_ts'].get(k, '')}",
                 "Golongan":                     ", ".join(sorted(ts_join["gol"].get(k, []))),
                 "Keberangkatan":                ", ".join(sorted(ts_join["asal"].get(k, []))),  # Asal (T-Summary)
                 "Tujuan":                       inv_first["tujuan"].get(k, ""),                 # Tujuan (Invoice)
@@ -349,7 +393,8 @@ if go:
                 "Selisih":                      format_idr(diff),
                 "Kategori":                     cat,
             }
-            if (not only_diff) or (diff != 0): out_rows.append(row)
+            out_rows.append(row)
+
             total_inv += v_inv; total_ts += v_ts; total_diff += diff
             naik += (cat == "Naik"); turun += (cat == "Turun"); sama += (cat == "Sama")
 
@@ -360,26 +405,22 @@ if go:
         m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
         m4.metric("Naik / Turun / Sama", f"{int(naik)} / {int(turun)} / {int(sama)}")
 
-        # Tabel & Download
+        # Download
         display_cols = [
             "Tanggal Invoice","Nomor Invoice","Kode Booking","Nomor Tiket",
-            "Nominal Invoice (SUMIFS)","Tanggal Pembayaran Invoice",
-            "Nominal T-Summary (SUMIFS)","Tanggal Pembayaran T-Summary",
+            "Invoice (Nominal; Tgl Bayar)","T-Summary (Nominal; Tgl Bayar)",
             "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
             "Channel","Merchant","Selisih","Kategori",
         ]
-        if show_table:
-            st.data_editor(out_rows, use_container_width=True, disabled=True, column_order=display_cols)
-
         xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
         st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_bytes,
-                           file_name="rekonsiliasi_xlsb_only.xlsx",
+                           file_name="rekonsiliasi_xlsb_auto_header.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         if errors:
             with st.expander("⚠️ Catatan pembacaan file", expanded=False):
                 for e in errors: st.caption(f"– {e}")
 
-    except Exception as e:
+    except Exception:
         st.error("❌ Terjadi error saat proses.")
-        st.code(str(e))
+        st.code(traceback.format_exc())
