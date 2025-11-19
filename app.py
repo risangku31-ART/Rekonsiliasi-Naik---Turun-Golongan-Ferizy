@@ -1,218 +1,58 @@
-# app.py
-# Rekonsiliasi Naik/Turun Golongan — SUMIFS (Basis: Invoice)
-# Perbaikan: Debug Mode + penanganan error agar tidak "Oh no" blank
+# app_mini_ram.py
+# Rekonsiliasi Naik/Turun Golongan (MINI-RAM, CSV only, streaming)
 
 import csv
 import io
 import re
-import traceback
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional
 from zipfile import ZipFile
-import xml.etree.ElementTree as ET
 import streamlit as st
 
-# ======== HARUS MENJADI PEMANGGILAN STREAMLIT PERTAMA ========
-st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan (SUMIFS)", layout="wide")
+# ---------- UI base ----------
+st.set_page_config(page_title="Rekonsiliasi (MINI-RAM, CSV only)", layout="wide")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — MINI-RAM (CSV only)")
 
-# ----------------------------- Utilities umum -----------------------------
-def has_module(name: str) -> bool:
-    try:
-        __import__(name)
-        return True
-    except Exception:
-        return False
+# Metric font kecil (why: supaya angka panjang tidak terpotong)
+st.markdown("""
+<style>
+div[data-testid="stMetricLabel"] { font-size: 11px !important; }
+div[data-testid="stMetricValue"] { font-size: 17px !important; }
+div[data-testid="stMetricValue"] > div { white-space: nowrap !important; overflow: visible !important; text-overflow: clip !important; }
+</style>
+""", unsafe_allow_html=True)
 
-def available_reader_engines() -> List[str]:
-    engines = ["pure-xlsx"]
-    if has_module("pandas") and has_module("openpyxl"):
-        engines.append("openpyxl")
-    if has_module("pandas") and has_module("pandas_calamine"):
-        engines.append("calamine")
-    if has_module("pandas") and has_module("xlrd"):
-        engines.append("xlrd")
-    return engines
-
+# ---------- Helpers ----------
 def guess_delimiter(sample: str) -> str:
     if "\t" in sample: return "\t"
     if sample.count(";") >= sample.count(",") and ";" in sample: return ";"
     if "," in sample: return ","
     return "|"
 
-def read_csv_file(file) -> List[Dict[str, str]]:
-    file.seek(0)
-    data = file.read()
-    text = data.decode("utf-8", errors="ignore") if isinstance(data, bytes) else str(data)
+def sniff_delimiter(file) -> str:
+    pos = file.tell()
+    head = file.read(4096)
+    if isinstance(head, bytes):
+        head = head.decode("utf-8", errors="ignore")
+    delim = guess_delimiter(head)
     try:
-        delim = csv.Sniffer().sniff(text[:2048]).delimiter
+        delim = csv.Sniffer().sniff(head).delimiter
     except Exception:
-        delim = guess_delimiter(text)
-    return [dict(r) for r in csv.DictReader(io.StringIO(text), delimiter=delim)]
-
-def read_paste(text: str) -> List[Dict[str, str]]:
-    text = (text or "").strip()
-    if not text: return []
-    delim = guess_delimiter(text)
-    try:
-        return [dict(r) for r in csv.DictReader(io.StringIO(text), delimiter=delim)]
-    except Exception:
-        return []
-
-# ----------------------------- Minimal XLSX Reader -----------------------------
-NS = {
-    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-}
-
-def _xlsx_col_to_idx(col: str) -> int:
-    n = 0
-    for ch in col:
-        if "A" <= ch <= "Z":
-            n = n * 26 + (ord(ch) - 64)
-    return n - 1
-
-def _xlsx_ref_to_rc(ref: str) -> Tuple[int, int]:
-    m = re.match(r"([A-Z]+)(\d+)", ref)
-    if not m: return 0, 0
-    col_letters, row_str = m.group(1), m.group(2)
-    return int(row_str) - 1, _xlsx_col_to_idx(col_letters)
-
-def _xlsx_read_shared_strings(z: ZipFile) -> List[str]:
-    sst = []
-    try:
-        with z.open("xl/sharedStrings.xml") as f:
-            tree = ET.parse(f)
-        for si in tree.getroot().iterfind(".//main:si", NS):
-            texts = [t.text or "" for t in si.findall(".//main:t", NS)]
-            sst.append("".join(texts))
-    except KeyError:
         pass
-    return sst
+    file.seek(pos)
+    return delim
 
-def _xlsx_find_first_sheet_path(z: ZipFile) -> Optional[str]:
-    if "xl/worksheets/sheet1.xml" in z.namelist():
-        return "xl/worksheets/sheet1.xml"
+def read_headers_csv(file) -> List[str]:
+    file.seek(0)
+    delim = sniff_delimiter(file)
+    tw = io.TextIOWrapper(file, encoding="utf-8", errors="ignore")
+    reader = csv.reader(tw, delimiter=delim)
     try:
-        with z.open("xl/workbook.xml") as f:
-            wb = ET.parse(f).getroot()
-        first_sheet = wb.find(".//main:sheets/main:sheet", NS)
-        if first_sheet is None: return None
-        rid = first_sheet.attrib.get(f"{{{NS['r']}}}id")
-        with z.open("xl/_rels/workbook.xml.rels") as f:
-            rels = ET.parse(f).getroot()
-        for rel in rels.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
-            if rel.attrib.get("Id") == rid:
-                target = rel.attrib.get("Target")
-                return "xl/" + target if not target.startswith("xl/") else target
-    except KeyError:
-        return None
-    return None
+        header = next(reader, [])
+    finally:
+        file.seek(0)
+    return [h.strip() for h in header]
 
-def read_xlsx_pure(bytes_data: bytes) -> List[Dict[str, str]]:
-    z = ZipFile(io.BytesIO(bytes_data))
-    sst = _xlsx_read_shared_strings(z)
-    sheet_path = _xlsx_find_first_sheet_path(z)
-    if not sheet_path: return []
-    with z.open(sheet_path) as f:
-        tree = ET.parse(f)
-    root = tree.getroot()
-    rows_dict: Dict[int, Dict[int, str]] = {}
-    max_col = -1
-    for c in root.findall(".//main:c", NS):
-        ref = c.attrib.get("r", "A1")
-        t = c.attrib.get("t")
-        v = c.find("main:v", NS)
-        is_node = c.find("main:is", NS)
-        text = ""
-        if t == "s":
-            idx = int(v.text) if v is not None and v.text else -1
-            text = sst[idx] if 0 <= idx < len(sst) else ""
-        elif t == "inlineStr" and is_node is not None:
-            ts = [t.text or "" for t in is_node.findall(".//main:t", NS)]
-            text = "".join(ts)
-        elif t == "b":
-            text = "TRUE" if (v is not None and v.text == "1") else "FALSE"
-        else:
-            text = (v.text or "") if v is not None else ""
-        r, cidx = _xlsx_ref_to_rc(ref)
-        rows_dict.setdefault(r, {})[cidx] = text
-        max_col = max(max_col, cidx)
-    if not rows_dict: return []
-    matrix: List[List[str]] = []
-    for r in sorted(rows_dict.keys()):
-        row = ["" for _ in range(max_col + 1)]
-        for cidx, val in rows_dict[r].items():
-            if 0 <= cidx <= max_col:
-                row[cidx] = val
-        matrix.append(row)
-    header: List[str] = []
-    data_start = 0
-    for i, row in enumerate(matrix):
-        if any(cell.strip() for cell in row):
-            header = row; data_start = i + 1; break
-    if not header: return []
-    seen = {}
-    final_header = []
-    for h in header:
-        base = (h or "").strip() or "COL"
-        name = base; k = 2
-        while name.lower() in seen:
-            name = f"{base}_{k}"; k += 1
-        seen[name.lower()] = True
-        final_header.append(name)
-    out: List[Dict[str, str]] = []
-    for row in matrix[data_start:]:
-        if not any(cell.strip() for cell in row): continue
-        rec = {final_header[j]: row[j] if j < len(row) else "" for j in range(len(final_header))}
-        out.append(rec)
-    return out
-
-# ----------------------------- Loader multi file -----------------------------
-def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]]:
-    if not files: return []
-    out: List[Dict[str, str]] = []
-    for f in files:
-        low = (f.name or "").lower()
-        rows: List[Dict[str, str]] = []
-        try:
-            if low.endswith(".csv"):
-                rows = read_csv_file(f)
-            elif low.endswith((".xlsx", ".xlsm")):
-                if safe_mode:
-                    st.warning(f"Lewati `{f.name}` (Excel) karena Safe Mode aktif. Unggah CSV atau matikan Safe Mode.")
-                else:
-                    if forced_engine == "pure-xlsx" or (forced_engine == "Auto" and "pure-xlsx" in available_reader_engines()):
-                        f.seek(0); data = f.read()
-                        rows = read_xlsx_pure(data)
-                    else:
-                        if not has_module("pandas"):
-                            st.warning(f"Lewati `{f.name}`: pandas tidak tersedia. Pilih `pure-xlsx`.")
-                        else:
-                            import pandas as pd
-                            eng = None
-                            if forced_engine == "openpyxl" and has_module("openpyxl"): eng = "openpyxl"
-                            elif forced_engine == "calamine" and has_module("pandas_calamine"): eng = "calamine"
-                            elif forced_engine == "Auto":
-                                if has_module("openpyxl"): eng = "openpyxl"
-                                elif has_module("pandas_calamine"): eng = "calamine"
-                            if eng:
-                                f.seek(0); df = pd.read_excel(f, dtype=str, engine=eng)
-                                rows = df.fillna("").astype(str).to_dict(orient="records")
-                            else:
-                                st.warning(f"Lewati `{f.name}`: Tidak ada engine openpyxl/calamine. Pilih `pure-xlsx`.")
-            elif low.endswith(".xls"):
-                st.warning(f"Lewati `{f.name}` (.xls lama). Konversi ke CSV/.xlsx.")
-            else:
-                rows = read_csv_file(f)
-        except Exception as e:
-            st.warning(f"Lewati `{f.name}`: {e}")
-            rows = []
-        for r in rows:
-            r["Sumber File"] = f.name
-        out.extend(rows)
-    return out
-
-# ----------------------------- Logic rekonsiliasi -----------------------------
-def normalize_colname(s: str) -> str:
+def normalize(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"[^a-z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -221,23 +61,17 @@ def normalize_colname(s: str) -> str:
            .replace("nilai", "harga").replace("tarip", "tarif"))
     return s
 
-def guess_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
-    cols = [c for c in columns if c is not None]
-    norm = {c: normalize_colname(c) for c in cols}
-    cand_norm = [normalize_colname(x) for x in candidates]
-    for cn in cand_norm:
-        for orig, nn in norm.items():
-            if nn == cn: return orig
-    for orig, nn in norm.items():
-        if any(cn in nn for cn in cand_norm): return orig
-    for orig, nn in norm.items():
-        if any(nn.startswith(cn) or nn.endswith(cn) for cn in cand_norm): return orig
-    return cols[0] if cols else None
-
-def coerce_invoice_key(x: str) -> str:
-    s = (x or "").strip()
-    s = re.sub(r"\s+", "", s)
-    return s.upper()
+def pick_guess(headers: List[str], candidates: List[str], default: Optional[str]=None) -> str:
+    if default and default in headers: return default
+    nh = {h: normalize(h) for h in headers}
+    cand = [normalize(c) for c in candidates]
+    for c in cand:
+        for h, n in nh.items():
+            if n == c: return h
+    for c in cand:
+        for h, n in nh.items():
+            if c in n: return h
+    return headers[0] if headers else ""
 
 def parse_money(x: str) -> float:
     if x is None: return 0.0
@@ -264,85 +98,32 @@ def format_idr(n: float) -> str:
     s = f"{float(n):,.2f}"
     return s.replace(",", "_").replace(".", ",").replace("_", ".")
 
-def union_columns(rows: List[Dict[str, str]]) -> List[str]:
-    cols, seen = [], set()
-    for r in rows:
-        for k in r.keys():
-            if k not in seen:
-                cols.append(k); seen.add(k)
-    return cols
+def coerce_key(x: str) -> str:
+    return re.sub(r"\s+", "", (x or "")).upper()
 
-def aggregate_sum(rows: List[Dict[str, str]], key_col: str, amt_col: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for r in rows:
-        key = coerce_invoice_key(r.get(key_col, ""))
-        val = parse_money(r.get(amt_col, "0"))
-        out[key] = out.get(key, 0.0) + val
-    return out
-
-def ordered_keys(rows: List[Dict[str, str]], key_col: str) -> List[str]:
-    seen = set(); order: List[str] = []
-    for r in rows:
-        k = coerce_invoice_key(r.get(key_col, ""))
-        if k and k not in seen:
-            seen.add(k); order.append(k)
-    return order
-
-def collect_first_map(rows: List[Dict[str, str]], key_col: str, val_col: Optional[str]) -> Dict[str, str]:
-    if not val_col: return {}
-    out: Dict[str, str] = {}
-    for r in rows:
-        k = coerce_invoice_key(r.get(key_col, ""))
-        v = (r.get(val_col, "") or "").strip()
-        if k and v and k not in out:
-            out[k] = v
-    return out
-
-def collect_unique_join_map(rows: List[Dict[str, str]], key_col: str, val_col: Optional[str], sep: str = ", ") -> Dict[str, str]:
-    if not val_col: return {}
-    out: Dict[str, str] = {}; seen_per_key: Dict[str, set] = {}
-    for r in rows:
-        k = coerce_invoice_key(r.get(key_col, ""))
-        v = (r.get(val_col, "") or "").strip()
-        if not k or not v: continue
-        s = seen_per_key.setdefault(k, set())
-        if v not in s:
-            s.add(v)
-            out[k] = f"{out[k]}{sep}{v}" if k in out else v
-    return out
-
-# ----------------------------- Minimal XLSX Writer -----------------------------
+# Minimal XLSX writer (inlineStr)
 def _col_letters(idx: int) -> str:
     s = ""; idx += 1
     while idx:
-        idx, r = divmod(idx - 1, 26)
-        s = chr(65 + r) + s
+        idx, r = divmod(idx - 1, 26); s = chr(65 + r) + s
     return s
-
-def _xml_escape(text: str) -> str:
-    return (text.replace("&", "&amp;").replace("<", "&lt;")
-                 .replace(">", "&gt;").replace('"', "&quot;")
-                 .replace("'", "&apos;"))
-
-def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str = "Rekonsiliasi") -> bytes:
-    lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>']
-    row_idx = 1
-    cells = []
-    for c_idx, col in enumerate(columns):
-        ref = f'{_col_letters(c_idx)}{row_idx}'
-        cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(col))}</t></is></c>')
-    lines.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
-    for r in rows:
-        row_idx += 1; cells = []
-        for c_idx, col in enumerate(columns):
-            val = "" if r.get(col) is None else str(r.get(col))
-            ref = f'{_col_letters(c_idx)}{row_idx}'
-            cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(val)}</t></is></c>')
-        lines.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
-    lines.append("</sheetData></worksheet>")
-    sheet_xml = "\n".join(lines).encode("utf-8")
+def _xml_escape(t: str) -> str:
+    return t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;").replace("'","&apos;")
+def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="Rekonsiliasi") -> bytes:
+    ws = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>']
+    r = 1
+    ws.append('<row r="1">' + "".join(
+        f'<c r="{_col_letters(i)}1" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(c)}</t></is></c>'
+        for i, c in enumerate(columns)) + "</row>")
+    for row in rows:
+        r += 1
+        ws.append(f'<row r="{r}">' + "".join(
+            f'<c r="{_col_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(row.get(c,"") or ""))}</t></is></c>'
+            for i, c in enumerate(columns)) + "</row>")
+    ws.append("</sheetData></worksheet>")
+    sheet_xml = "\n".join(ws).encode("utf-8")
     content_types = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -366,9 +147,8 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str =
 </Relationships>'''
     styles = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <fonts count="1"><font/></fonts><fills count="1"><fill/></fills>
-  <borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs>
-  <cellXfs count="1"><xf xfId="0"/></cellXfs>
+  <fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf xfId="0"/></cellXfs>
 </styleSheet>'''
     bio = io.BytesIO()
     with ZipFile(bio, "w") as z:
@@ -380,222 +160,173 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str =
         z.writestr("xl/styles.xml", styles)
     return bio.getvalue()
 
-# ----------------------------- App -----------------------------
-def run_app():
-    st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)")
-    st.markdown("""
-    <style>
-    div[data-testid="stMetricLabel"] { font-size: 12px !important; }
-    div[data-testid="stMetricValue"] { font-size: 18px !important; }
-    div[data-testid="stMetricValue"] > div { white-space: nowrap !important; overflow: visible !important; text-overflow: clip !important; }
-    </style>
-    """, unsafe_allow_html=True)
+# ---------- Upload ----------
+with st.sidebar:
+    st.header("1) Upload CSV (multiple)")
+    inv_files = st.file_uploader("📄 Invoice (CSV)", type=["csv"], accept_multiple_files=True)
+    ts_files  = st.file_uploader("🎫 T-Summary (CSV)", type=["csv"], accept_multiple_files=True)
+    st.caption("Versi mini: **CSV saja** untuk hemat RAM.")
 
-    with st.expander("ℹ️ Mode & Engine", expanded=True):
-        safe_mode = st.toggle("Safe Mode (CSV & PASTE only)", value=False)
-        avail = available_reader_engines()
-        forced_engine = st.selectbox("Paksa engine Excel", options=(["Auto"] + avail) if not safe_mode else ["Auto"], index=0)
-        st.write(f"**Status:** {'🟢 Safe Mode ON' if safe_mode else '🔵 Safe Mode OFF'} — Engine: {', '.join(avail)}")
+if not inv_files or not ts_files:
+    st.info("Unggah minimal satu CSV untuk **Invoice** dan **T-Summary**.")
+    st.stop()
 
-    with st.sidebar:
-        st.header("1) Upload File (Multiple)")
-        inv_files = st.file_uploader("📄 Invoice — CSV/XLSX/XLSM/XLS", type=["csv","xlsx","xlsm","xls"], accept_multiple_files=True)
-        tik_files = st.file_uploader("🎫 Tiket Summary — CSV/XLSX/XLSM/XLS", type=["csv","xlsx","xlsm","xls"], accept_multiple_files=True)
-        st.caption("Patokan = Nomor Invoice dari uploader Invoice (SUMIFS/LEFT JOIN).")
+# ---------- Mapping (ambil header dari file pertama setiap grup) ----------
+inv_headers = read_headers_csv(inv_files[0])
+ts_headers  = read_headers_csv(ts_files[0])
 
-    st.subheader("Opsional: Tempel Data dari Excel")
-    c1, c2 = st.columns(2)
-    with c1: paste_inv = st.text_area("PASTE — Invoice (TSV/CSV)", height=160)
-    with c2: paste_tik = st.text_area("PASTE — Tiket Summary (TSV/CSV)", height=160)
+st.subheader("2) Pemetaan Kolom (ringkas)")
+c1, c2 = st.columns(2)
 
-    rows_inv: List[Dict[str, str]] = []
-    rows_inv.extend(load_many(inv_files, safe_mode, forced_engine))
-    for r in read_paste(paste_inv):
-        r["Sumber File"] = "PASTE:Invoice"; rows_inv.append(r)
+with c1:
+    st.markdown("**Invoice (CSV)**")
+    inv_key = st.selectbox("Nomor Invoice", options=inv_headers,
+                           index=inv_headers.index(pick_guess(inv_headers, ["nomor invoice","no invoice","invoice"])) if inv_headers else 0)
+    inv_amt = st.selectbox("Nominal/Harga", options=inv_headers,
+                           index=inv_headers.index(pick_guess(inv_headers, ["harga","nominal","amount","total"])) if inv_headers else 0)
+    inv_tgl_inv   = st.selectbox("Tanggal Invoice", inv_headers, index=inv_headers.index(pick_guess(inv_headers, ["tanggal invoice","tgl invoice","tanggal","tgl"])) if inv_headers else 0)
+    inv_pay_inv   = st.selectbox("Tanggal Pembayaran Invoice", inv_headers, index=inv_headers.index(pick_guess(inv_headers, ["tanggal invoice","pembayaran","tgl pembayaran"])) if inv_headers else 0)
+    inv_tujuan    = st.selectbox("Tujuan", inv_headers, index=inv_headers.index(pick_guess(inv_headers, ["tujuan","destination"])) if inv_headers else 0)
+    inv_channel   = st.selectbox("Channel", inv_headers, index=inv_headers.index(pick_guess(inv_headers, ["channel"])) if inv_headers else 0)
+    inv_merchant  = st.selectbox("Merchant", inv_headers, index=inv_headers.index(pick_guess(inv_headers, ["merchant","mid"])) if inv_headers else 0)
 
-    rows_tik: List[Dict[str, str]] = []
-    rows_tik.extend(load_many(tik_files, safe_mode, forced_engine))
-    for r in read_paste(paste_tik):
-        r["Sumber File"] = "PASTE:TiketSummary"; rows_tik.append(r)
+with c2:
+    st.markdown("**T-Summary (CSV)**")
+    ts_key = st.selectbox("Nomor Invoice (T-Summary)", ts_headers,
+                          index=ts_headers.index(pick_guess(ts_headers, ["nomor invoice","no invoice","invoice"])) if ts_headers else 0)
+    ts_amt = st.selectbox("Nominal/Tarif", ts_headers,
+                          index=ts_headers.index(pick_guess(ts_headers, ["tarif","harga","nominal","amount","total"])) if ts_headers else 0)
+    ts_kode_bk  = st.selectbox("Kode Booking", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["kode booking","kode boking"])) if ts_headers else 0)
+    ts_no_tiket = st.selectbox("Nomor Tiket", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["nomor tiket","no tiket","ticket"])) if ts_headers else 0)
+    ts_pay_ts   = st.selectbox("Tanggal Pembayaran T-Summary", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["pembayaran","tanggal pembayaran","tgl pembayaran"])) if ts_headers else 0)
+    ts_gol      = st.selectbox("Golongan", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["golongan","kelas"])) if ts_headers else 0)
+    ts_asal     = st.selectbox("Keberangkatan / Asal", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["asal","keberangkatan"])) if ts_headers else 0)
+    ts_cetak_bp = st.selectbox("Tgl Cetak Boarding Pass", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["cetak boarding pass","tgl cetak"])) if ts_headers else 0)
 
-    if not rows_inv or not rows_tik:
-        st.info("Unggah minimal satu file/PASTE untuk **Invoice** dan **Tiket Summary**.")
-        return
+only_diff = st.checkbox("Hanya Selisih ≠ 0", value=False)
+show_table = st.checkbox("Tampilkan Tabel (berat, bisa lambat)", value=False)
+go = st.button("🚀 Proses (MINI-RAM)")
 
-    st.divider(); st.subheader("2) Pemetaan Kolom")
-    inv_cols = union_columns(rows_inv); tik_cols = union_columns(rows_tik)
+# ---------- Streaming aggregator ----------
+def stream_rows(file, headers_wanted: List[str]) -> csv.DictReader:
+    file.seek(0)
+    delim = sniff_delimiter(file)
+    tw = io.TextIOWrapper(file, encoding="utf-8", errors="ignore")
+    return csv.DictReader(tw, delimiter=delim)
 
-    inv_key_guess = guess_column(inv_cols, ["nomor invoice","no invoice","invoice","invoice number","no faktur","nomor faktur"])
-    inv_amt_guess = guess_column(inv_cols, ["harga","nilai","amount","nominal","total","grand total"])
-    tik_key_guess = guess_column(tik_cols, ["nomor invoice","no invoice","invoice","invoice number","no faktur","nomor faktur"])
-    tik_amt_guess = guess_column(tik_cols, ["tarif","harga","nilai","amount","nominal","total","grand total"])
+if go:
+    # Aggregates
+    agg_inv: Dict[str, float] = {}
+    agg_ts: Dict[str, float] = {}
+    keys_order: List[str] = []
+    seen_keys = set()
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**Invoice — kolom utama**")
-        inv_key = st.selectbox("Kolom Nomor Invoice (Invoice)", inv_cols, index=inv_cols.index(inv_key_guess) if inv_key_guess in inv_cols else 0)
-        inv_amt = st.selectbox("Kolom Nominal/Harga (Invoice)", inv_cols, index=inv_cols.index(inv_amt_guess) if inv_amt_guess in inv_cols else 0)
-    with col_b:
-        st.markdown("**Tiket Summary — kolom utama**")
-        tik_key = st.selectbox("Kolom Nomor Invoice (T-Summary)", tik_cols, index=tik_cols.index(tik_key_guess) if tik_key_guess in tik_cols else 0)
-        tik_amt = st.selectbox("Kolom Nominal/Tarif (T-Summary)", tik_cols, index=tik_cols.index(tik_amt_guess) if tik_amt_guess in tik_cols else 0)
+    # Maps (first/unique)
+    inv_first = { "tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {} }
+    ts_first  = { "pay_ts": {} }
+    ts_join_sets = { "kode_bk": {}, "no_tiket": {}, "gol": {}, "asal": {}, "cetak_bp": {} }
 
-    def select_with_empty(label: str, options: List[str], guess: Optional[str] = None):
-        opts = ["— Kosong —"] + options
-        idx = (options.index(guess) + 1) if guess in options else 0
-        return st.selectbox(label, opts, index=idx)
+    # --- Process Invoice CSVs (stream) ---
+    for f in inv_files:
+        reader = stream_rows(f, [])
+        for row in reader:
+            key = coerce_key(row.get(inv_key, ""))
+            if not key: continue
+            if key not in seen_keys:
+                seen_keys.add(key); keys_order.append(key)
+            agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(row.get(inv_amt, "0"))
+            # first values
+            if key not in inv_first["tgl_inv"] and row.get(inv_tgl_inv, ""): inv_first["tgl_inv"][key] = row.get(inv_tgl_inv, "")
+            if key not in inv_first["pay_inv"] and row.get(inv_pay_inv, ""): inv_first["pay_inv"][key] = row.get(inv_pay_inv, "")
+            if key not in inv_first["tujuan"] and row.get(inv_tujuan, ""):  inv_first["tujuan"][key]  = row.get(inv_tujuan, "")
+            if key not in inv_first["channel"] and row.get(inv_channel, ""): inv_first["channel"][key] = row.get(inv_channel, "")
+            if key not in inv_first["merchant"] and row.get(inv_merchant, ""): inv_first["merchant"][key] = row.get(inv_merchant, "")
 
-    inv_tgl_inv_guess   = guess_column(inv_cols, ["tanggal invoice","tgl invoice","tanggal","tgl"])
-    inv_pay_inv_guess   = guess_column(inv_cols, ["tanggal invoice","tgl invoice","pembayaran","tgl pembayaran"])
-    inv_tujuan_guess    = guess_column(inv_cols, ["tujuan","destination","destinasi"])
-    inv_channel_guess   = guess_column(inv_cols, ["channel"])
-    inv_merchant_guess  = guess_column(inv_cols, ["merchant","mid","acquirer"])
+    # --- Process T-Summary CSVs (stream) ---
+    def add_join(dsets: Dict[str, set], k: str, v: str):
+        if not v: return
+        s = dsets.setdefault(k, set()); s.add(v)
 
-    ts_kode_booking_guess = guess_column(tik_cols, ["kode booking","kode boking","booking code"])
-    ts_nomor_tiket_guess  = guess_column(tik_cols, ["nomor tiket","no tiket","ticket"])
-    ts_pay_ts_guess       = guess_column(tik_cols, ["pembayaran","tanggal pembayaran","tgl bayar","tgl pembayaran"])
-    ts_golongan_guess     = guess_column(tik_cols, ["golongan","kelas","class"])
-    ts_asal_guess         = guess_column(tik_cols, ["asal","keberangkatan","origin"])
-    ts_cetak_bp_guess     = guess_column(tik_cols, ["cetak boarding pass","tgl cetak","boarding pass"])
+    for f in ts_files:
+        reader = stream_rows(f, [])
+        for row in reader:
+            key = coerce_key(row.get(ts_key, ""))
+            if not key: continue
+            agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(row.get(ts_amt, "0"))
+            if key not in ts_first["pay_ts"] and row.get(ts_pay_ts, ""): ts_first["pay_ts"][key] = row.get(ts_pay_ts, "")
+            add_join(ts_join_sets["kode_bk"], key, row.get(ts_kode_bk, ""))
+            add_join(ts_join_sets["no_tiket"], key, row.get(ts_no_tiket, ""))
+            add_join(ts_join_sets["gol"], key, row.get(ts_gol, ""))
+            add_join(ts_join_sets["asal"], key, row.get(ts_asal, ""))
+            add_join(ts_join_sets["cetak_bp"], key, row.get(ts_cetak_bp, ""))
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Tambahan dari Invoice**")
-        sel_inv_tgl_inv   = select_with_empty("Tanggal Invoice (Invoice)", inv_cols, inv_tgl_inv_guess)
-        sel_inv_pay_inv   = select_with_empty("Tanggal Pembayaran Invoice", inv_cols, inv_pay_inv_guess)
-        sel_inv_tujuan    = select_with_empty("Tujuan (Invoice)", inv_cols, inv_tujuan_guess)
-        sel_inv_channel   = select_with_empty("Channel (Invoice)", inv_cols, inv_channel_guess)
-        sel_inv_merchant  = select_with_empty("Merchant (Invoice)", inv_cols, inv_merchant_guess)
-    with c2:
-        st.markdown("**Tambahan dari T-Summary**")
-        sel_ts_kode_bk    = select_with_empty("Kode Booking (T-Summary)", tik_cols, ts_kode_booking_guess)
-        sel_ts_no_tiket   = select_with_empty("Nomor Tiket (T-Summary)", tik_cols, ts_nomor_tiket_guess)
-        sel_ts_pay_ts     = select_with_empty("Tanggal Pembayaran T-Summary", tik_cols, ts_pay_ts_guess)
-        sel_ts_golongan   = select_with_empty("Golongan (T-Summary)", tik_cols, ts_golongan_guess)
-        sel_ts_asal       = select_with_empty("Keberangkatan / Asal (T-Summary)", tik_cols, ts_asal_guess)
-        sel_ts_cetak_bp   = select_with_empty("Tgl Cetak Boarding Pass (T-Summary)", tik_cols, ts_cetak_bp_guess)
+    # --- Build result rows (optionally store) ---
+    out_rows: List[Dict[str, str]] = []
+    total_inv = total_ts = total_diff = 0.0
+    naik = turun = sama = 0
 
-    def none_if_empty(x: str) -> Optional[str]:
-        return None if x == "— Kosong —" else x
+    for k in keys_order:
+        v_inv = float(agg_inv.get(k, 0.0))
+        v_ts  = float(agg_ts.get(k, 0.0))
+        diff = v_inv - v_ts
+        # Kategori: Invoice > T-Summary => "Turun", sebaliknya "Naik"
+        if v_inv > v_ts: cat = "Turun"
+        elif v_inv < v_ts: cat = "Naik"
+        else: cat = "Sama"
 
-    inv_tgl_inv_col   = none_if_empty(sel_inv_tgl_inv)
-    inv_pay_inv_col   = none_if_empty(sel_inv_pay_inv)
-    inv_tujuan_col    = none_if_empty(sel_inv_tujuan)
-    inv_channel_col   = none_if_empty(sel_inv_channel)
-    inv_merchant_col  = none_if_empty(sel_inv_merchant)
+        row = {
+            "Tanggal Invoice":              inv_first["tgl_inv"].get(k, ""),
+            "Nomor Invoice":                k,
+            "Kode Booking":                 ", ".join(sorted(ts_join_sets["kode_bk"].get(k, []))),
+            "Nomor Tiket":                  ", ".join(sorted(ts_join_sets["no_tiket"].get(k, []))),
+            "Nominal Invoice (SUMIFS)":     format_idr(v_inv),
+            "Tanggal Pembayaran Invoice":   inv_first["pay_inv"].get(k, ""),
+            "Nominal T-Summary (SUMIFS)":   format_idr(v_ts),
+            "Tanggal Pembayaran T-Summary": ts_first["pay_ts"].get(k, ""),
+            "Golongan":                     ", ".join(sorted(ts_join_sets["gol"].get(k, []))),
+            "Keberangkatan":                ", ".join(sorted(ts_join_sets["asal"].get(k, []))),   # Asal dari T-Summary
+            "Tujuan":                       inv_first["tujuan"].get(k, ""),                      # Tujuan dari Invoice
+            "Tgl Cetak Boarding Pass":      ", ".join(sorted(ts_join_sets["cetak_bp"].get(k, []))),
+            "Channel":                      inv_first["channel"].get(k, ""),
+            "Merchant":                     inv_first["merchant"].get(k, ""),
+            "Selisih":                      format_idr(diff),
+            "Kategori":                     cat,
+        }
+        if (not only_diff) or (diff != 0):
+            out_rows.append(row)
 
-    ts_kode_bk_col    = none_if_empty(sel_ts_kode_bk)
-    ts_no_tiket_col   = none_if_empty(sel_ts_no_tiket)
-    ts_pay_ts_col     = none_if_empty(sel_ts_pay_ts)
-    ts_gol_col        = none_if_empty(sel_ts_golongan)
-    ts_asal_col       = none_if_empty(sel_ts_asal)
-    ts_cetak_bp_col   = none_if_empty(sel_ts_cetak_bp)
+        total_inv += v_inv; total_ts += v_ts; total_diff += diff
+        if cat == "Naik": naik += 1
+        elif cat == "Turun": turun += 1
+        else: sama += 1
 
-    st.divider(); st.subheader("3) Proses Rekonsiliasi — SUMIFS (Basis Invoice)")
-    only_diff = st.checkbox("Hanya tampilkan yang berbeda (Selisih ≠ 0)", value=False)
-    go = st.button("🚀 Proses")
+    # --- Metrics ---
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
+    m2.metric("Total T-Summary (SUMIFS)", format_idr(total_ts))
+    m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
+    m4.metric("Naik / Turun / Sama", f"{naik} / {turun} / {sama}")
 
-    if go:
-        try:
-            agg_inv = aggregate_sum(rows_inv, inv_key, inv_amt)
-            agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)
-            keys_ordered = ordered_keys(rows_inv, inv_key)
+    # --- Tabel opsional (berat) ---
+    if show_table:
+        display_cols = [
+            "Tanggal Invoice","Nomor Invoice","Kode Booking","Nomor Tiket",
+            "Nominal Invoice (SUMIFS)","Tanggal Pembayaran Invoice",
+            "Nominal T-Summary (SUMIFS)","Tanggal Pembayaran T-Summary",
+            "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
+            "Channel","Merchant","Selisih","Kategori",
+        ]
+        st.data_editor(out_rows, use_container_width=True, disabled=True, column_order=display_cols)
 
-            inv_tgl_inv_map   = collect_first_map(rows_inv, inv_key, inv_tgl_inv_col)
-            inv_pay_inv_map   = collect_first_map(rows_inv, inv_key, inv_pay_inv_col)
-            inv_tujuan_map    = collect_first_map(rows_inv, inv_key, inv_tujuan_col)
-            inv_channel_map   = collect_first_map(rows_inv, inv_key, inv_channel_col)
-            inv_merchant_map  = collect_first_map(rows_inv, inv_key, inv_merchant_col)
-
-            ts_kode_bk_map    = collect_unique_join_map(rows_tik, tik_key, ts_kode_bk_col)
-            ts_no_tiket_map   = collect_unique_join_map(rows_tik, tik_key, ts_no_tiket_col)
-            ts_pay_ts_map     = collect_first_map(rows_tik, tik_key, ts_pay_ts_col)
-            ts_gol_map        = collect_unique_join_map(rows_tik, tik_key, ts_gol_col)
-            ts_asal_map       = collect_unique_join_map(rows_tik, tik_key, ts_asal_col)
-            ts_cetak_bp_map   = collect_unique_join_map(rows_tik, tik_key, ts_cetak_bp_col)
-
-            out_rows: List[Dict[str, str]] = []
-            total_inv = total_tik = total_diff = 0.0
-            naik = turun = sama = 0
-
-            for k in keys_ordered:
-                v_inv = float(agg_inv.get(k, 0.0))
-                v_tik = float(agg_tik.get(k, 0.0))
-                diff = v_inv - v_tik
-
-                # Kategori (sesuai request terakhir): Invoice > T-Summary => "Turun"
-                if v_inv > v_tik: cat = "Turun"
-                elif v_inv < v_tik: cat = "Naik"
-                else: cat = "Sama"
-
-                row = {
-                    "Tanggal Invoice":              inv_tgl_inv_map.get(k, ""),
-                    "Nomor Invoice":                k,
-                    "Kode Booking":                 ts_kode_bk_map.get(k, ""),
-                    "Nomor Tiket":                  ts_no_tiket_map.get(k, ""),
-                    "Nominal Invoice (SUMIFS)":     format_idr(v_inv),
-                    "Tanggal Pembayaran Invoice":   inv_pay_inv_map.get(k, ""),
-                    "Nominal T-Summary (SUMIFS)":   format_idr(v_tik),
-                    "Tanggal Pembayaran T-Summary": ts_pay_ts_map.get(k, ""),
-                    "Golongan":                     ts_gol_map.get(k, ""),
-                    "Keberangkatan":                ts_asal_map.get(k, ""),
-                    "Tujuan":                       inv_tujuan_map.get(k, ""),
-                    "Tgl Cetak Boarding Pass":      ts_cetak_bp_map.get(k, ""),
-                    "Channel":                      inv_channel_map.get(k, ""),
-                    "Merchant":                     inv_merchant_map.get(k, ""),
-                    "Selisih":                      format_idr(diff),
-                    "Kategori":                     cat,
-                }
-                if (not only_diff) or (diff != 0): out_rows.append(row)
-
-                total_inv += v_inv; total_tik += v_tik; total_diff += diff
-                if cat == "Naik": naik += 1
-                elif cat == "Turun": turun += 1
-                else: sama += 1
-
-            extra_tik_only = len(set(agg_tik.keys()) - set(keys_ordered))
-            if extra_tik_only:
-                st.caption(f"ℹ️ {extra_tik_only} Nomor Invoice hanya ada di T-Summary (diabaikan — basis Invoice).")
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
-            m2.metric("Total T-Summary (SUMIFS)", format_idr(total_tik))
-            m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
-            m4.metric("Naik / Turun / Sama", f"{naik} / {turun} / {sama}")
-
-            st.subheader("Hasil Rekonsiliasi (SUMIFS, Basis Invoice)")
-            display_cols = [
-                "Tanggal Invoice","Nomor Invoice","Kode Booking","Nomor Tiket",
-                "Nominal Invoice (SUMIFS)","Tanggal Pembayaran Invoice",
-                "Nominal T-Summary (SUMIFS)","Tanggal Pembayaran T-Summary",
-                "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
-                "Channel","Merchant","Selisih","Kategori",
-            ]
-            st.data_editor(out_rows, use_container_width=True, disabled=True, key="result", column_order=display_cols)
-
-            xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
-            st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_bytes,
-                               file_name="rekonsiliasi_sumifs_basis_invoice.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.error("❌ Terjadi error saat memproses rekonsiliasi.")
-            st.code(traceback.format_exc())
-
-    with st.expander("🔧 Diagnostics", expanded=False):
-        st.write("Engines:", ", ".join(available_reader_engines()))
-        st.write("Rows Invoice:", len(rows_inv), " | Rows T-Summary:", len(rows_tik))
-        try:
-            st.write("Kolom Invoice:", union_columns(rows_inv))
-            st.write("Kolom T-Summary:", union_columns(rows_tik))
-        except Exception:
-            pass
-
-def safe_run(fn):
-    try:
-        fn()
-    except Exception:
-        st.error("⚠️ Gagal menjalankan aplikasi pada level teratas.")
-        st.code(traceback.format_exc())
-
-# Jalankan
-safe_run(run_app)
+    # --- Download Excel (ringan) ---
+    display_cols = [
+        "Tanggal Invoice","Nomor Invoice","Kode Booking","Nomor Tiket",
+        "Nominal Invoice (SUMIFS)","Tanggal Pembayaran Invoice",
+        "Nominal T-Summary (SUMIFS)","Tanggal Pembayaran T-Summary",
+        "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
+        "Channel","Merchant","Selisih","Kategori",
+    ]
+    xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
+    st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_bytes,
+        file_name="rekonsiliasi_mini_ram.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
