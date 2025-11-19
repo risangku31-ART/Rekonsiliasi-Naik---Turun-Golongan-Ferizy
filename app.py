@@ -1,11 +1,9 @@
 # app.py
-# Rekonsiliasi Naik/Turun Golongan — SUMIFS (Basis: Invoice)
+# Rekonsiliasi Naik/Turun Golongan — SUMIFS (Basis: Invoice) + Download Excel
 # - Preview disembunyikan
 # - Keberangkatan ← T-Summary: "Asal"
 # - Tujuan ← Invoice: "Tujuan"
-# - Unduhan: Excel (.xlsx) via writer murni-Python
-# - Metric: font diperkecil via CSS
-# - Kategori: Invoice > T-Summary => "Turun", sebaliknya "Naik", sama "Sama"
+# - Unduhan: Excel (.xlsx) via writer murni-Python (tanpa dependency)
 
 import csv
 import io
@@ -27,7 +25,7 @@ def has_module(name: str) -> bool:
 
 
 def available_reader_engines() -> List[str]:
-    engines = ["pure-xlsx"]
+    engines = ["pure-xlsx"]  # reader .xlsx fallback
     if has_module("pandas") and has_module("openpyxl"):
         engines.append("openpyxl")
     if has_module("pandas") and has_module("pandas_calamine"):
@@ -410,16 +408,19 @@ def _xml_escape(text: str) -> str:
     )
 
 def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str = "Rekonsiliasi") -> bytes:
+    # Build sheet XML (inlineStr to avoid sharedStrings)
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
              '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
              'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
              "<sheetData>"]
+    # header
     row_idx = 1
     cells = []
     for c_idx, col in enumerate(columns):
         ref = f'{_col_letters(c_idx)}{row_idx}'
         cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(col))}</t></is></c>')
     lines.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
+    # data
     for r in rows:
         row_idx += 1
         cells = []
@@ -478,22 +479,6 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str =
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan (SUMIFS)", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)")
 
-# kecilkan font metric
-st.markdown(
-    """
-    <style>
-    div[data-testid="stMetricLabel"] { font-size: 12px !important; }
-    div[data-testid="stMetricValue"] { font-size: 18px !important; }
-    div[data-testid="stMetricValue"] > div {
-        white-space: nowrap !important;
-        overflow: visible !important;
-        text-overflow: clip !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 with st.expander("ℹ️ Mode & Engine", expanded=True):
     safe_mode = st.toggle(
         "Safe Mode (CSV & PASTE only)",
@@ -541,6 +526,8 @@ rows_tik.extend(load_many(tik_files, safe_mode, forced_engine))
 for r in read_paste(paste_tik):
     r["Sumber File"] = "PASTE:TiketSummary"; rows_tik.append(r)
 
+# (Preview disembunyikan)
+
 if not rows_inv or not rows_tik:
     st.info("Unggah minimal satu file/PASTE untuk **Invoice** dan **Tiket Summary**.")
     st.stop()
@@ -551,6 +538,7 @@ st.subheader("2) Pemetaan Kolom")
 
 inv_cols = union_columns(rows_inv); tik_cols = union_columns(rows_tik)
 
+# key & nominal
 inv_key_guess = guess_column(inv_cols, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"])
 inv_amt_guess = guess_column(inv_cols, ["harga", "nilai", "amount", "nominal", "total", "grand total"])
 tik_key_guess = guess_column(tik_cols, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"])
@@ -575,7 +563,7 @@ def select_with_empty(label: str, options: List[str], guess: Optional[str] = Non
         idx = options.index(guess) + 1
     return st.selectbox(label, opts, index=idx)
 
-# Guesses
+# Guesses (Keberangkatan=Asal dari T-Summary, Tujuan dari Invoice)
 inv_tgl_inv_guess   = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "tanggal", "tgl"])
 inv_pay_inv_guess   = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "pembayaran", "tgl pembayaran"])
 inv_tujuan_guess    = guess_column(inv_cols, ["tujuan", "destination", "destinasi"])
@@ -634,6 +622,7 @@ if go:
     agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)
     keys_ordered = ordered_keys(rows_inv, inv_key)
 
+    # Maps tambahan
     inv_tgl_inv_map   = collect_first_map(rows_inv, inv_key, inv_tgl_inv_col)
     inv_pay_inv_map   = collect_first_map(rows_inv, inv_key, inv_pay_inv_col)
     inv_tujuan_map    = collect_first_map(rows_inv, inv_key, inv_tujuan_col)
@@ -655,14 +644,7 @@ if go:
         v_inv = float(agg_inv.get(k, 0.0))
         v_tik = float(agg_tik.get(k, 0.0))
         diff = v_inv - v_tik
-
-        # >>> KATEGORI BARU <<<
-        if v_inv > v_tik:
-            cat = "Turun"
-        elif v_inv < v_tik:
-            cat = "Naik"
-        else:
-            cat = "Sama"
+        cat = "Naik" if diff > 0 else ("Turun" if diff < 0 else "Sama")
 
         row = {
             "Tanggal Invoice":              inv_tgl_inv_map.get(k, ""),
@@ -674,8 +656,8 @@ if go:
             "Nominal T-Summary (SUMIFS)":   format_idr(v_tik),
             "Tanggal Pembayaran T-Summary": ts_pay_ts_map.get(k, ""),
             "Golongan":                     ts_gol_map.get(k, ""),
-            "Keberangkatan":                ts_asal_map.get(k, ""),
-            "Tujuan":                       inv_tujuan_map.get(k, ""),
+            "Keberangkatan":                ts_asal_map.get(k, ""),    # dari T-Summary (Asal)
+            "Tujuan":                       inv_tujuan_map.get(k, ""),  # dari Invoice (Tujuan)
             "Tgl Cetak Boarding Pass":      ts_cetak_bp_map.get(k, ""),
             "Channel":                      inv_channel_map.get(k, ""),
             "Merchant":                     inv_merchant_map.get(k, ""),
@@ -705,6 +687,7 @@ if go:
 
     st.subheader("Hasil Rekonsiliasi (SUMIFS, Basis Invoice)")
 
+    # Urutan kolom sesuai permintaan (+ Selisih, Kategori di akhir)
     display_cols = [
         "Tanggal Invoice",
         "Nomor Invoice",
@@ -732,7 +715,7 @@ if go:
         column_order=display_cols,
     )
 
-    # Download Excel
+    # --- Download Excel (.xlsx) ---
     xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
     st.download_button(
         "⬇️ Download Excel (.xlsx)",
