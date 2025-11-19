@@ -1,21 +1,25 @@
-# app_mini_ram_zip_excel.py
-# Rekonsiliasi Naik/Turun Golongan — MINI-RAM
-# Fitur: Uploader CSV + Excel (.xlsx/.xlsm) + ZIP (berisi CSV/XLSX)
-# Kategori: Invoice > T-Summary => "Turun", sebaliknya "Naik"
+# app_safe.py
+# Rekonsiliasi Naik/Turun Golongan — SAFE & MINI-RAM
+# - Tahan error: try/except per tahap + stacktrace
+# - Dukungan: CSV / XLSX / XLSM / ZIP (CSV+XLSX di dalamnya)
+# - SUMIFS basis Invoice, kategori: Inv > T-Sum => "Turun"
+# - Download Excel via writer pure-Python (tanpa dependency)
 
 import csv
 import io
 import re
-from typing import Dict, List, Optional, Iterable, Generator
+import traceback
+from typing import Dict, List, Optional, Iterable, Generator, Tuple
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import streamlit as st
 
-# ---------------- UI basic ----------------
-st.set_page_config(page_title="Rekonsiliasi (MINI-RAM: CSV/Excel/ZIP)", layout="wide")
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — MINI-RAM (CSV / Excel / ZIP)")
 
-# Metric kecil
+# ============================== BOOTSTRAP (WAJIB PALING AWAL) ==============================
+st.set_page_config(page_title="Rekonsiliasi (SAFE & MINI-RAM)", layout="wide")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — SAFE & MINI-RAM")
+
+# Font metric kecil agar tidak terpotong
 st.markdown("""
 <style>
 div[data-testid="stMetricLabel"] { font-size: 11px !important; }
@@ -24,7 +28,26 @@ div[data-testid="stMetricValue"] > div { white-space: nowrap !important; overflo
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Helpers umum ----------------
+
+# ============================== UTIL: SAFE WRAPPER ==============================
+def safe_section(title: str):
+    """Context manager menampilkan error block rapi di UI."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        try:
+            with st.status(f"{title}", state="running") as s:
+                yield s
+                s.update(label=f"{title} ✅", state="complete")
+        except Exception:
+            st.error(f"❌ Gagal pada langkah: {title}")
+            st.code(traceback.format_exc())
+            st.stop()
+    return _cm()
+
+
+# ============================== HELPER UMUM ==============================
 def guess_delimiter(sample: str) -> str:
     if "\t" in sample: return "\t"
     if sample.count(";") >= sample.count(",") and ";" in sample: return ";"
@@ -87,22 +110,26 @@ def format_idr(n: float) -> str:
 def coerce_key(x: str) -> str:
     return re.sub(r"\s+", "", (x or "")).upper()
 
-# ---------------- Minimal XLSX reader (pure Python) ----------------
+
+# ============================== XLSX READER (PURE PYTHON) ==============================
 NS = {
     "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
+
 def _xlsx_col_to_idx(col: str) -> int:
     n = 0
     for ch in col:
         if "A" <= ch <= "Z":
             n = n * 26 + (ord(ch) - 64)
     return n - 1
-def _xlsx_ref_to_rc(ref: str):
+
+def _xlsx_ref_to_rc(ref: str) -> Tuple[int, int]:
     m = re.match(r"([A-Z]+)(\d+)", ref)
     if not m: return 0, 0
     col_letters, row_str = m.group(1), m.group(2)
     return int(row_str) - 1, _xlsx_col_to_idx(col_letters)
+
 def _xlsx_read_shared_strings(z: ZipFile) -> List[str]:
     sst = []
     try:
@@ -114,6 +141,7 @@ def _xlsx_read_shared_strings(z: ZipFile) -> List[str]:
     except KeyError:
         pass
     return sst
+
 def _xlsx_find_first_sheet_path(z: ZipFile) -> Optional[str]:
     if "xl/worksheets/sheet1.xml" in z.namelist():
         return "xl/worksheets/sheet1.xml"
@@ -132,7 +160,9 @@ def _xlsx_find_first_sheet_path(z: ZipFile) -> Optional[str]:
     except KeyError:
         return None
     return None
-def read_xlsx_pure_bytes(b: bytes) -> List[Dict[str, str]]:
+
+def read_xlsx_rows(b: bytes) -> List[Dict[str, str]]:
+    """Sederhana: baca sheet pertama seluruhnya ke list of dict (cukup aman untuk file menengah)."""
     z = ZipFile(io.BytesIO(b))
     sst = _xlsx_read_shared_strings(z)
     sheet_path = _xlsx_find_first_sheet_path(z)
@@ -140,10 +170,14 @@ def read_xlsx_pure_bytes(b: bytes) -> List[Dict[str, str]]:
     with z.open(sheet_path) as f:
         tree = ET.parse(f)
     root = tree.getroot()
-    rows_dict: Dict[int, Dict[int, str]] = {}; max_col = -1
+
+    rows_dict: Dict[int, Dict[int, str]] = {}
+    max_col = -1
     for c in root.findall(".//main:c", NS):
-        ref = c.attrib.get("r", "A1"); t = c.attrib.get("t")
-        v = c.find("main:v", NS); is_node = c.find("main:is", NS)
+        ref = c.attrib.get("r", "A1")
+        t = c.attrib.get("t")
+        v = c.find("main:v", NS)
+        is_node = c.find("main:is", NS)
         text = ""
         if t == "s":
             idx = int(v.text) if v is not None and v.text else -1
@@ -158,36 +192,52 @@ def read_xlsx_pure_bytes(b: bytes) -> List[Dict[str, str]]:
         r, cidx = _xlsx_ref_to_rc(ref)
         rows_dict.setdefault(r, {})[cidx] = text
         max_col = max(max_col, cidx)
+
     if not rows_dict: return []
-    # build matrix
+    # Build matrix
     matrix: List[List[str]] = []
     for r in sorted(rows_dict.keys()):
         row = ["" for _ in range(max_col + 1)]
         for cidx, val in rows_dict[r].items():
-            if 0 <= cidx <= max_col: row[cidx] = val
+            if 0 <= cidx <= max_col:
+                row[cidx] = val
         matrix.append(row)
-    # header
-    header = []; data_start = 0
+
+    # Header
+    header: List[str] = []
+    data_start = 0
     for i, row in enumerate(matrix):
         if any(cell.strip() for cell in row):
-            header = row; data_start = i + 1; break
+            header = row
+            data_start = i + 1
+            break
     if not header: return []
-    seen = {}; final_header = []
+
+    # Dedup header names
+    seen = {}
+    final_header = []
     for h in header:
-        base = (h or "").strip() or "COL"; name = base; k = 2
+        base = (h or "").strip() or "COL"
+        name = base
+        k = 2
         while name.lower() in seen:
-            name = f"{base}_{k}"; k += 1
-        seen[name.lower()] = True; final_header.append(name)
+            name = f"{base}_{k}"
+            k += 1
+        seen[name.lower()] = True
+        final_header.append(name)
+
     out: List[Dict[str, str]] = []
     for row in matrix[data_start:]:
-        if not any(cell.strip() for cell in row): continue
+        if not any(cell.strip() for cell in row):
+            continue
         rec = {}
         for j, name in enumerate(final_header):
             rec[name] = row[j] if j < len(row) else ""
         out.append(rec)
     return out
 
-# ---------------- ZIP/CSV/XLSX iter helpers ----------------
+
+# ============================== ITERATOR FILE (CSV/XLSX/ZIP) ==============================
 def iter_csv_rows_from_bytes(b: bytes) -> Generator[Dict[str, str], None, None]:
     delim = sniff_delimiter_from_bytes(b)
     tw = io.TextIOWrapper(io.BytesIO(b), encoding="utf-8", errors="ignore")
@@ -196,38 +246,45 @@ def iter_csv_rows_from_bytes(b: bytes) -> Generator[Dict[str, str], None, None]:
         yield {k: (v if v is not None else "") for k, v in row.items()}
 
 def iter_xlsx_rows_from_bytes(b: bytes) -> Generator[Dict[str, str], None, None]:
-    rows = read_xlsx_pure_bytes(b)
-    for r in rows:
+    for r in read_xlsx_rows(b):
         yield r
 
-def iter_uploaded_file_rows(f) -> Generator[Dict[str, str], None, None]:
+def iter_uploaded_file_rows(f, collect_errors: List[str]) -> Generator[Dict[str, str], None, None]:
+    """Kembalikan row dict untuk setiap file (UploadedFile / ZIP entries). Format tidak dikenal -> dilewati."""
     name = (f.name or "").lower()
-    if name.endswith(".csv"):
-        f.seek(0); b = f.read(); yield from iter_csv_rows_from_bytes(b)
-    elif name.endswith((".xlsx", ".xlsm")):
-        f.seek(0); b = f.read(); yield from iter_xlsx_rows_from_bytes(b)
-    elif name.endswith(".zip"):
-        f.seek(0); zb = io.BytesIO(f.read())
-        with ZipFile(zb) as z:
-            for zi in z.infolist():
-                if zi.is_dir(): continue
-                zname = zi.filename.lower()
-                if not (zname.endswith(".csv") or zname.endswith((".xlsx", ".xlsm"))):
-                    continue
-                with z.open(zi) as fh:
-                    data = fh.read()
-                if zname.endswith(".csv"):
-                    yield from iter_csv_rows_from_bytes(data)
-                else:
-                    yield from iter_xlsx_rows_from_bytes(data)
-    else:
-        # format lain diabaikan
+    try:
+        if name.endswith(".csv"):
+            f.seek(0); b = f.read(); yield from iter_csv_rows_from_bytes(b)
+        elif name.endswith((".xlsx", ".xlsm")):
+            f.seek(0); b = f.read(); yield from iter_xlsx_rows_from_bytes(b)
+        elif name.endswith(".zip"):
+            f.seek(0); zb = io.BytesIO(f.read())
+            with ZipFile(zb) as z:
+                for zi in z.infolist():
+                    if zi.is_dir(): continue
+                    zname = zi.filename.lower()
+                    if not (zname.endswith(".csv") or zname.endswith((".xlsx", ".xlsm"))):
+                        continue
+                    try:
+                        with z.open(zi) as fh:
+                            data = fh.read()
+                        if zname.endswith(".csv"):
+                            yield from iter_csv_rows_from_bytes(data)
+                        else:
+                            yield from iter_xlsx_rows_from_bytes(data)
+                    except Exception as e:
+                        collect_errors.append(f"Gagal baca entry ZIP `{zi.filename}`: {e}")
+                        continue
+        else:
+            collect_errors.append(f"Format `{f.name}` tidak didukung (hanya CSV/XLSX/ZIP).")
+            return
+    except Exception as e:
+        collect_errors.append(f"Gagal baca `{f.name}`: {e}")
         return
 
-def read_headers_from_uploaded(files: List) -> List[str]:
-    if not files: return []
-    # cari header pertama yang bisa dibaca (CSV->XLSX->ZIP entries)
-    for f in files:
+def read_headers_from_uploaded(files: List, collect_errors: List[str]) -> List[str]:
+    """Ambil header dari file pertama yang berhasil dibaca."""
+    for f in files or []:
         n = (f.name or "").lower()
         try:
             if n.endswith(".csv"):
@@ -239,7 +296,7 @@ def read_headers_from_uploaded(files: List) -> List[str]:
                 if row: return [h.strip() for h in row]
             elif n.endswith((".xlsx", ".xlsm")):
                 f.seek(0); b = f.read()
-                rows = read_xlsx_pure_bytes(b)
+                rows = read_xlsx_rows(b)
                 if rows: return list(rows[0].keys())
             elif n.endswith(".zip"):
                 f.seek(0); zb = io.BytesIO(f.read())
@@ -248,30 +305,40 @@ def read_headers_from_uploaded(files: List) -> List[str]:
                         if zi.is_dir(): continue
                         zname = zi.filename.lower()
                         if zname.endswith(".csv"):
-                            with z.open(zi) as fh:
-                                data = fh.read()
-                            delim = sniff_delimiter_from_bytes(data)
-                            tw = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="ignore")
-                            reader = csv.reader(tw, delimiter=delim)
-                            row = next(reader, [])
-                            if row: return [h.strip() for h in row]
+                            try:
+                                with z.open(zi) as fh:
+                                    data = fh.read()
+                                delim = sniff_delimiter_from_bytes(data)
+                                tw = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="ignore")
+                                reader = csv.reader(tw, delimiter=delim)
+                                row = next(reader, [])
+                                if row: return [h.strip() for h in row]
+                            except Exception:
+                                continue
                         elif zname.endswith((".xlsx", ".xlsm")):
-                            with z.open(zi) as fh:
-                                data = fh.read()
-                            rows = read_xlsx_pure_bytes(data)
-                            if rows: return list(rows[0].keys())
-        except Exception:
+                            try:
+                                with z.open(zi) as fh:
+                                    data = fh.read()
+                                rows = read_xlsx_rows(data)
+                                if rows: return list(rows[0].keys())
+                            except Exception:
+                                continue
+        except Exception as e:
+            collect_errors.append(f"Gagal deteksi header `{f.name}`: {e}")
             continue
     return []
 
-# ---------------- Minimal XLSX writer (pure Python) ----------------
+
+# ============================== XLSX WRITER (PURE PYTHON) ==============================
 def _col_letters(idx: int) -> str:
     s = ""; idx += 1
     while idx:
         idx, r = divmod(idx - 1, 26); s = chr(65 + r) + s
     return s
+
 def _xml_escape(t: str) -> str:
     return t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;").replace("'","&apos;")
+
 def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="Rekonsiliasi") -> bytes:
     ws = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
           '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -287,6 +354,7 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="
             for i, c in enumerate(columns)) + "</row>")
     ws.append("</sheetData></worksheet>")
     sheet_xml = "\n".join(ws).encode("utf-8")
+
     content_types = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -323,20 +391,32 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str="
         z.writestr("xl/styles.xml", styles)
     return bio.getvalue()
 
-# ---------------- Uploaders (CSV/XLSX/ZIP) ----------------
+
+# ============================== UPLOADERS ==============================
 with st.sidebar:
     st.header("1) Upload (CSV / XLSX / ZIP) — multiple")
     inv_files = st.file_uploader("📄 Invoice", type=["csv","xlsx","xlsm","zip"], accept_multiple_files=True)
     ts_files  = st.file_uploader("🎫 T-Summary", type=["csv","xlsx","xlsm","zip"], accept_multiple_files=True)
-    st.caption("ZIP boleh berisi banyak CSV/XLSX. Sheet pertama yang dipakai untuk XLSX.")
+    st.caption("ZIP boleh berisi banyak CSV/XLSX. Untuk Excel, hanya sheet pertama yang dipakai.")
 
 if not inv_files or not ts_files:
     st.info("Unggah minimal satu file untuk **Invoice** dan **T-Summary**.")
     st.stop()
 
-# ---------------- Mapping (ambil header dari file pertama tiap grup) ---------------
-inv_headers = read_headers_from_uploaded(inv_files)
-ts_headers  = read_headers_from_uploaded(ts_files)
+
+# ============================== HEADER MAPPING ==============================
+errors: List[str] = []
+with safe_section("Deteksi header"):
+    inv_headers = read_headers_from_uploaded(inv_files, errors)
+    ts_headers  = read_headers_from_uploaded(ts_files, errors)
+    if not inv_headers:
+        st.error("Tidak bisa mendeteksi header dari berkas Invoice mana pun.")
+        for e in errors: st.caption(f"– {e}")
+        st.stop()
+    if not ts_headers:
+        st.error("Tidak bisa mendeteksi header dari berkas T-Summary mana pun.")
+        for e in errors: st.caption(f"– {e}")
+        st.stop()
 
 st.subheader("2) Pemetaan Kolom")
 c1, c2 = st.columns(2)
@@ -365,114 +445,139 @@ with c2:
     ts_cetak_bp = st.selectbox("Tgl Cetak Boarding Pass", ts_headers, index=ts_headers.index(pick_guess(ts_headers, ["cetak boarding pass","tgl cetak"])) if ts_headers else 0)
 
 only_diff  = st.checkbox("Hanya Selisih ≠ 0", value=False)
-show_table = st.checkbox("Tampilkan Tabel (bisa berat)", value=False)
+show_table = st.checkbox("Tampilkan Tabel (opsional)", value=False)
 go = st.button("🚀 Proses")
 
-# ---------------- Proses (stream) ----------------
+
+# ============================== PROSES (SAFE) ==============================
 if go:
-    # Aggregates
-    agg_inv: Dict[str, float] = {}
-    agg_ts: Dict[str, float] = {}
-    keys_order: List[str] = []
-    seen_keys = set()
+    with safe_section("Membaca & menggabung data"):
+        read_errors: List[str] = []
 
-    # Maps
-    inv_first = { "tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {} }
-    ts_first  = { "pay_ts": {} }
-    ts_join_sets = { "kode_bk": {}, "no_tiket": {}, "gol": {}, "asal": {}, "cetak_bp": {} }
+        # Aggregates
+        agg_inv: Dict[str, float] = {}
+        agg_ts: Dict[str, float] = {}
+        keys_order: List[str] = []
+        seen_keys = set()
 
-    def add_join(dsets: Dict[str, set], k: str, v: str):
-        if not v: return
-        s = dsets.setdefault(k, set()); s.add(v)
+        # Maps
+        inv_first = { "tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {} }
+        ts_first  = { "pay_ts": {} }
+        ts_join_sets = { "kode_bk": {}, "no_tiket": {}, "gol": {}, "asal": {}, "cetak_bp": {} }
 
-    # Invoice files
-    for f in inv_files:
-        for row in iter_uploaded_file_rows(f):
-            key = coerce_key(row.get(inv_key, ""))
-            if not key: continue
-            if key not in seen_keys:
-                seen_keys.add(key); keys_order.append(key)
-            agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(row.get(inv_amt, "0"))
-            if key not in inv_first["tgl_inv"] and row.get(inv_tgl_inv, ""): inv_first["tgl_inv"][key] = row.get(inv_tgl_inv, "")
-            if key not in inv_first["pay_inv"] and row.get(inv_pay_inv, ""): inv_first["pay_inv"][key] = row.get(inv_pay_inv, "")
-            if key not in inv_first["tujuan"] and row.get(inv_tujuan, ""):  inv_first["tujuan"][key]  = row.get(inv_tujuan, "")
-            if key not in inv_first["channel"] and row.get(inv_channel, ""): inv_first["channel"][key] = row.get(inv_channel, "")
-            if key not in inv_first["merchant"] and row.get(inv_merchant, ""): inv_first["merchant"][key] = row.get(inv_merchant, "")
+        def add_join(dsets: Dict[str, set], k: str, v: str):
+            if not v: return
+            s = dsets.setdefault(k, set()); s.add(v)
 
-    # T-Summary files
-    for f in ts_files:
-        for row in iter_uploaded_file_rows(f):
-            key = coerce_key(row.get(ts_key, ""))
-            if not key: continue
-            agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(row.get(ts_amt, "0"))
-            if key not in ts_first["pay_ts"] and row.get(ts_pay_ts, ""): ts_first["pay_ts"][key] = row.get(ts_pay_ts, "")
-            add_join(ts_join_sets["kode_bk"], key, row.get(ts_kode_bk, ""))
-            add_join(ts_join_sets["no_tiket"], key, row.get(ts_no_tiket, ""))
-            add_join(ts_join_sets["gol"], key, row.get(ts_gol, ""))
-            add_join(ts_join_sets["asal"], key, row.get(ts_asal, ""))
-            add_join(ts_join_sets["cetak_bp"], key, row.get(ts_cetak_bp, ""))
+        # Invoice
+        for f in inv_files:
+            for row in iter_uploaded_file_rows(f, read_errors):
+                try:
+                    key = coerce_key(row.get(inv_key, ""))
+                    if not key: continue
+                    if key not in seen_keys:
+                        seen_keys.add(key); keys_order.append(key)
+                    agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(row.get(inv_amt, "0"))
+                    if key not in inv_first["tgl_inv"] and row.get(inv_tgl_inv, ""): inv_first["tgl_inv"][key] = row.get(inv_tgl_inv, "")
+                    if key not in inv_first["pay_inv"] and row.get(inv_pay_inv, ""): inv_first["pay_inv"][key] = row.get(inv_pay_inv, "")
+                    if key not in inv_first["tujuan"] and row.get(inv_tujuan, ""):  inv_first["tujuan"][key]  = row.get(inv_tujuan, "")
+                    if key not in inv_first["channel"] and row.get(inv_channel, ""): inv_first["channel"][key] = row.get(inv_channel, "")
+                    if key not in inv_first["merchant"] and row.get(inv_merchant, ""): inv_first["merchant"][key] = row.get(inv_merchant, "")
+                except Exception as e:
+                    read_errors.append(f"Invoice row error @{f.name}: {e}")
+                    continue
 
-    # Hasil
-    out_rows: List[Dict[str, str]] = []
-    total_inv = total_ts = total_diff = 0.0
-    naik = turun = sama = 0
+        # T-Summary
+        for f in ts_files:
+            for row in iter_uploaded_file_rows(f, read_errors):
+                try:
+                    key = coerce_key(row.get(ts_key, ""))
+                    if not key: continue
+                    agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(row.get(ts_amt, "0"))
+                    if key not in ts_first["pay_ts"] and row.get(ts_pay_ts, ""): ts_first["pay_ts"][key] = row.get(ts_pay_ts, "")
+                    add_join(ts_join_sets["kode_bk"], key, row.get(ts_kode_bk, ""))
+                    add_join(ts_join_sets["no_tiket"], key, row.get(ts_no_tiket, ""))
+                    add_join(ts_join_sets["gol"], key, row.get(ts_gol, ""))
+                    add_join(ts_join_sets["asal"], key, row.get(ts_asal, ""))
+                    add_join(ts_join_sets["cetak_bp"], key, row.get(ts_cetak_bp, ""))
+                except Exception as e:
+                    read_errors.append(f"T-Summary row error @{f.name}: {e}")
+                    continue
 
-    for k in keys_order:
-        v_inv = float(agg_inv.get(k, 0.0))
-        v_ts  = float(agg_ts.get(k, 0.0))
-        diff = v_inv - v_ts
+        if read_errors:
+            with st.expander("⚠️ Catatan pembacaan file (detail)", expanded=False):
+                for e in read_errors:
+                    st.caption(f"– {e}")
 
-        # Kategori: Invoice > T-Summary => "Turun"
-        if v_inv > v_ts: cat = "Turun"
-        elif v_inv < v_ts: cat = "Naik"
-        else: cat = "Sama"
+    with safe_section("Menyusun hasil & metrik"):
+        out_rows: List[Dict[str, str]] = []
+        total_inv = total_ts = total_diff = 0.0
+        naik = turun = sama = 0
 
-        row = {
-            "Tanggal Invoice":              inv_first["tgl_inv"].get(k, ""),
-            "Nomor Invoice":                k,
-            "Kode Booking":                 ", ".join(sorted(ts_join_sets["kode_bk"].get(k, []))),
-            "Nomor Tiket":                  ", ".join(sorted(ts_join_sets["no_tiket"].get(k, []))),
-            "Nominal Invoice (SUMIFS)":     format_idr(v_inv),
-            "Tanggal Pembayaran Invoice":   inv_first["pay_inv"].get(k, ""),
-            "Nominal T-Summary (SUMIFS)":   format_idr(v_ts),
-            "Tanggal Pembayaran T-Summary": ts_first["pay_ts"].get(k, ""),
-            "Golongan":                     ", ".join(sorted(ts_join_sets["gol"].get(k, []))),
-            "Keberangkatan":                ", ".join(sorted(ts_join_sets["asal"].get(k, []))),   # Asal (T-Summary)
-            "Tujuan":                       inv_first["tujuan"].get(k, ""),                      # Tujuan (Invoice)
-            "Tgl Cetak Boarding Pass":      ", ".join(sorted(ts_join_sets["cetak_bp"].get(k, []))),
-            "Channel":                      inv_first["channel"].get(k, ""),
-            "Merchant":                     inv_first["merchant"].get(k, ""),
-            "Selisih":                      format_idr(diff),
-            "Kategori":                     cat,
-        }
-        if (not only_diff) or (diff != 0):
-            out_rows.append(row)
+        for k in keys_order:
+            v_inv = float(agg_inv.get(k, 0.0))
+            v_ts  = float(agg_ts.get(k, 0.0))
+            diff = v_inv - v_ts
 
-        total_inv += v_inv; total_ts += v_ts; total_diff += diff
-        if cat == "Naik": naik += 1
-        elif cat == "Turun": turun += 1
-        else: sama += 1
+            # Kategori: Invoice > T-Summary => "Turun"
+            if v_inv > v_ts: cat = "Turun"
+            elif v_inv < v_ts: cat = "Naik"
+            else: cat = "Sama"
 
-    # Metrics
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
-    m2.metric("Total T-Summary (SUMIFS)", format_idr(total_ts))
-    m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
-    m4.metric("Naik / Turun / Sama", f"{naik} / {turun} / {sama}")
+            row = {
+                "Tanggal Invoice":              inv_first["tgl_inv"].get(k, ""),
+                "Nomor Invoice":                k,
+                "Kode Booking":                 ", ".join(sorted(ts_join_sets["kode_bk"].get(k, []))),
+                "Nomor Tiket":                  ", ".join(sorted(ts_join_sets["no_tiket"].get(k, []))),
+                "Nominal Invoice (SUMIFS)":     format_idr(v_inv),
+                "Tanggal Pembayaran Invoice":   inv_first["pay_inv"].get(k, ""),
+                "Nominal T-Summary (SUMIFS)":   format_idr(v_ts),
+                "Tanggal Pembayaran T-Summary": ts_first["pay_ts"].get(k, ""),
+                "Golongan":                     ", ".join(sorted(ts_join_sets["gol"].get(k, []))),
+                "Keberangkatan":                ", ".join(sorted(ts_join_sets["asal"].get(k, []))),   # Asal (T-Summary)
+                "Tujuan":                       inv_first["tujuan"].get(k, ""),                      # Tujuan (Invoice)
+                "Tgl Cetak Boarding Pass":      ", ".join(sorted(ts_join_sets["cetak_bp"].get(k, []))),
+                "Channel":                      inv_first["channel"].get(k, ""),
+                "Merchant":                     inv_first["merchant"].get(k, ""),
+                "Selisih":                      format_idr(diff),
+                "Kategori":                     cat,
+            }
+            if (not only_diff) or (diff != 0):
+                out_rows.append(row)
 
-    # Tabel (opsional)
-    display_cols = [
-        "Tanggal Invoice","Nomor Invoice","Kode Booking","Nomor Tiket",
-        "Nominal Invoice (SUMIFS)","Tanggal Pembayaran Invoice",
-        "Nominal T-Summary (SUMIFS)","Tanggal Pembayaran T-Summary",
-        "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
-        "Channel","Merchant","Selisih","Kategori",
-    ]
-    if show_table:
-        st.data_editor(out_rows, use_container_width=True, disabled=True, column_order=display_cols)
+            total_inv += v_inv; total_ts += v_ts; total_diff += diff
+            if cat == "Naik": naik += 1
+            elif cat == "Turun": turun += 1
+            else: sama += 1
 
-    # Download Excel
-    xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
-    st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_bytes,
-                       file_name="rekonsiliasi_mini_ram_zip_excel.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
+        m2.metric("Total T-Summary (SUMIFS)", format_idr(total_ts))
+        m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
+        m4.metric("Naik / Turun / Sama", f"{naik} / {turun} / {sama}")
+
+        display_cols = [
+            "Tanggal Invoice","Nomor Invoice","Kode Booking","Nomor Tiket",
+            "Nominal Invoice (SUMIFS)","Tanggal Pembayaran Invoice",
+            "Nominal T-Summary (SUMIFS)","Tanggal Pembayaran T-Summary",
+            "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
+            "Channel","Merchant","Selisih","Kategori",
+        ]
+
+        if show_table:
+            st.data_editor(out_rows, use_container_width=True, disabled=True, column_order=display_cols)
+
+    with safe_section("Ekspor Excel"):
+        xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
+        st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_bytes,
+                           file_name="rekonsiliasi_safe_miniram.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    with st.expander("🔎 Diagnostics", expanded=False):
+        st.write("Invoice files:", [f.name for f in inv_files])
+        st.write("T-Summary files:", [f.name for f in ts_files])
+        st.write("Header Invoice (detected):", inv_headers)
+        st.write("Header T-Summary (detected):", ts_headers)
+        if errors:
+            st.write("Header detection notes:")
+            for e in errors: st.caption(f"– {e}")
