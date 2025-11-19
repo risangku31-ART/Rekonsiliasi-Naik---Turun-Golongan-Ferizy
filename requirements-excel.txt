@@ -9,7 +9,6 @@ openpyxl==3.1.5          # reader .xlsx/.xlsm
 pandas-calamine==0.2.3   # alternatif reader .xlsx/.xlsm
 xlrd==2.0.1              # reader .xls legacy
 xlsxwriter==3.2.0        # writer .xlsx
-streamlit>=1.26
 pyxlsb>=1.0.10
 
 # app.py
