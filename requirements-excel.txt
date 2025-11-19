@@ -10,4 +10,4 @@ pandas-calamine==0.2.3   # alternatif reader .xlsx/.xlsm
 xlrd==2.0.1              # reader .xls legacy
 xlsxwriter==3.2.0        # writer .xlsx
 pyxlsb>=1.0.10
-
+streamlit>=1.26\npyxlsb>=1.0.10
