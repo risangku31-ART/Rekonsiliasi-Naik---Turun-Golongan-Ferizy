@@ -1,9 +1,11 @@
 # app.py
-# Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)
+# Rekonsiliasi Naik/Turun Golongan — SUMIFS (Basis: Invoice)
 # - Preview disembunyikan
-# - Keberangkatan dari T-Summary: "Asal"
-# - Tujuan dari Invoice: "Tujuan"
-# - Urutan kolom sesuai permintaan + Selisih & Kategori di akhir
+# - Keberangkatan ← T-Summary: "Asal"
+# - Tujuan ← Invoice: "Tujuan"
+# - Unduhan: Excel (.xlsx) via writer murni-Python
+# - Metric: font diperkecil via CSS
+# - Kategori: Invoice > T-Summary => "Turun", sebaliknya "Naik", sama "Sama"
 
 import csv
 import io
@@ -25,7 +27,7 @@ def has_module(name: str) -> bool:
 
 
 def available_reader_engines() -> List[str]:
-    engines = ["pure-xlsx"]  # fallback .xlsx tanpa dependency eksternal
+    engines = ["pure-xlsx"]
     if has_module("pandas") and has_module("openpyxl"):
         engines.append("openpyxl")
     if has_module("pandas") and has_module("pandas_calamine"):
@@ -223,7 +225,7 @@ def load_many(files, safe_mode: bool, forced_engine: str) -> List[Dict[str, str]
                         if not has_module("pandas"):
                             st.warning(f"Lewati `{f.name}`: pandas tidak tersedia. Pilih `pure-xlsx`.")
                         else:
-                            import pandas as pd  # why: hanya bila tersedia
+                            import pandas as pd
                             eng = None
                             if forced_engine == "openpyxl" and has_module("openpyxl"):
                                 eng = "openpyxl"
@@ -389,9 +391,108 @@ def collect_unique_join_map(rows: List[Dict[str, str]], key_col: str, val_col: O
     return out
 
 
+# ----------------------------- Minimal XLSX Writer (pure-Python) -----------------------------
+def _col_letters(idx: int) -> str:
+    s = ""
+    idx += 1
+    while idx:
+        idx, r = divmod(idx - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _xml_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;")
+    )
+
+def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name: str = "Rekonsiliasi") -> bytes:
+    lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+             "<sheetData>"]
+    row_idx = 1
+    cells = []
+    for c_idx, col in enumerate(columns):
+        ref = f'{_col_letters(c_idx)}{row_idx}'
+        cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(str(col))}</t></is></c>')
+    lines.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
+    for r in rows:
+        row_idx += 1
+        cells = []
+        for c_idx, col in enumerate(columns):
+            val = "" if r.get(col) is None else str(r.get(col))
+            ref = f'{_col_letters(c_idx)}{row_idx}'
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_xml_escape(val)}</t></is></c>')
+        lines.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
+    lines.append("</sheetData></worksheet>")
+    sheet_xml = "\n".join(lines).encode("utf-8")
+
+    content_types = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+    rels_root = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    wb_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="{_xml_escape(sheet_name)}" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>'''.encode("utf-8")
+    wb_rels = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    styles = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font/></fonts>
+  <fills count="1"><fill/></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf/></cellStyleXfs>
+  <cellXfs count="1"><xf xfId="0"/></cellXfs>
+</styleSheet>'''
+    bio = io.BytesIO()
+    with ZipFile(bio, "w") as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels_root)
+        z.writestr("xl/workbook.xml", wb_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        z.writestr("xl/styles.xml", styles)
+    return bio.getvalue()
+
+
 # ----------------------------- UI -----------------------------
 st.set_page_config(page_title="Rekonsiliasi Naik/Turun Golongan (SUMIFS)", layout="wide")
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Mode SUMIFS (Basis: Invoice)")
+
+# kecilkan font metric
+st.markdown(
+    """
+    <style>
+    div[data-testid="stMetricLabel"] { font-size: 12px !important; }
+    div[data-testid="stMetricValue"] { font-size: 18px !important; }
+    div[data-testid="stMetricValue"] > div {
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.expander("ℹ️ Mode & Engine", expanded=True):
     safe_mode = st.toggle(
@@ -440,8 +541,6 @@ rows_tik.extend(load_many(tik_files, safe_mode, forced_engine))
 for r in read_paste(paste_tik):
     r["Sumber File"] = "PASTE:TiketSummary"; rows_tik.append(r)
 
-# (Preview disembunyikan)
-
 if not rows_inv or not rows_tik:
     st.info("Unggah minimal satu file/PASTE untuk **Invoice** dan **Tiket Summary**.")
     st.stop()
@@ -452,7 +551,6 @@ st.subheader("2) Pemetaan Kolom")
 
 inv_cols = union_columns(rows_inv); tik_cols = union_columns(rows_tik)
 
-# key & nominal
 inv_key_guess = guess_column(inv_cols, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"])
 inv_amt_guess = guess_column(inv_cols, ["harga", "nilai", "amount", "nominal", "total", "grand total"])
 tik_key_guess = guess_column(tik_cols, ["nomor invoice", "no invoice", "invoice", "invoice number", "no faktur", "nomor faktur"])
@@ -477,7 +575,7 @@ def select_with_empty(label: str, options: List[str], guess: Optional[str] = Non
         idx = options.index(guess) + 1
     return st.selectbox(label, opts, index=idx)
 
-# Guesses sesuai aturan (Keberangkatan=Asal dari T-Summary, Tujuan dari Invoice)
+# Guesses
 inv_tgl_inv_guess   = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "tanggal", "tgl"])
 inv_pay_inv_guess   = guess_column(inv_cols, ["tanggal invoice", "tgl invoice", "pembayaran", "tgl pembayaran"])
 inv_tujuan_guess    = guess_column(inv_cols, ["tujuan", "destination", "destinasi"])
@@ -536,7 +634,6 @@ if go:
     agg_tik = aggregate_sum(rows_tik, tik_key, tik_amt)
     keys_ordered = ordered_keys(rows_inv, inv_key)
 
-    # Maps tambahan
     inv_tgl_inv_map   = collect_first_map(rows_inv, inv_key, inv_tgl_inv_col)
     inv_pay_inv_map   = collect_first_map(rows_inv, inv_key, inv_pay_inv_col)
     inv_tujuan_map    = collect_first_map(rows_inv, inv_key, inv_tujuan_col)
@@ -558,7 +655,14 @@ if go:
         v_inv = float(agg_inv.get(k, 0.0))
         v_tik = float(agg_tik.get(k, 0.0))
         diff = v_inv - v_tik
-        cat = "Naik" if diff > 0 else ("Turun" if diff < 0 else "Sama")
+
+        # >>> KATEGORI BARU <<<
+        if v_inv > v_tik:
+            cat = "Turun"
+        elif v_inv < v_tik:
+            cat = "Naik"
+        else:
+            cat = "Sama"
 
         row = {
             "Tanggal Invoice":              inv_tgl_inv_map.get(k, ""),
@@ -570,8 +674,8 @@ if go:
             "Nominal T-Summary (SUMIFS)":   format_idr(v_tik),
             "Tanggal Pembayaran T-Summary": ts_pay_ts_map.get(k, ""),
             "Golongan":                     ts_gol_map.get(k, ""),
-            "Keberangkatan":                ts_asal_map.get(k, ""),    # dari T-Summary (Asal)
-            "Tujuan":                       inv_tujuan_map.get(k, ""),  # dari Invoice (Tujuan)
+            "Keberangkatan":                ts_asal_map.get(k, ""),
+            "Tujuan":                       inv_tujuan_map.get(k, ""),
             "Tgl Cetak Boarding Pass":      ts_cetak_bp_map.get(k, ""),
             "Channel":                      inv_channel_map.get(k, ""),
             "Merchant":                     inv_merchant_map.get(k, ""),
@@ -601,7 +705,6 @@ if go:
 
     st.subheader("Hasil Rekonsiliasi (SUMIFS, Basis Invoice)")
 
-    # Urutan kolom sesuai permintaan (+ Selisih, Kategori di akhir)
     display_cols = [
         "Tanggal Invoice",
         "Nomor Invoice",
@@ -629,11 +732,11 @@ if go:
         column_order=display_cols,
     )
 
-    # Download CSV dengan urutan kolom yang sama
-    si = io.StringIO()
-    w = csv.writer(si)
-    w.writerow(display_cols)
-    for r in out_rows:
-        w.writerow([r.get(c, "") for c in display_cols])
-    st.download_button("⬇️ Download CSV", data=si.getvalue().encode("utf-8"),
-                       file_name="rekonsiliasi_sumifs_basis_invoice.csv", mime="text/csv")
+    # Download Excel
+    xlsx_bytes = build_xlsx(display_cols, out_rows, sheet_name="Rekonsiliasi")
+    st.download_button(
+        "⬇️ Download Excel (.xlsx)",
+        data=xlsx_bytes,
+        file_name="rekonsiliasi_sumifs_basis_invoice.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
