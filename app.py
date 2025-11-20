@@ -1,6 +1,19 @@
-# file: app_min_rekon_xlsb_preview.py
-# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — versi ringkas + Preview
-# Requirements:
+# =========================
+# file: .streamlit/config.toml
+# =========================
+# Paste ke file ini untuk mengatur batas upload secara resmi (tanpa error)
+# Buat folder `.streamlit` di root, lalu simpan sebagai `config.toml`
+
+# [server]
+# maxUploadSize = 2048   # dalam MB
+# maxMessageSize = 512   # opsional
+
+
+# =========================
+# file: app.py
+# =========================
+# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — ringkas + preview + fix upload size
+# Requirements minimal:
 #   streamlit>=1.26
 #   pyxlsb>=1.0.10
 
@@ -10,11 +23,17 @@ import tempfile
 from typing import Dict, List, Optional
 import streamlit as st
 
-# ====== Konfigurasi App ======
+# ---------- Page ----------
 st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Ringkas + Preview", layout="wide")
-st.set_option("server.maxUploadSize", 2048)  # why: kapasitas upload besar (MB)
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) Ringkas + Preview")
+# NOTE: set upload limit sebaiknya via .streamlit/config.toml; wrapper di bawah hanya agar tidak crash
+def _try_set_max_upload(mb: int) -> None:
+    try:
+        st.set_option("server.maxUploadSize", int(mb))  # bisa ditolak di runtime -> diamkan jika gagal
+    except Exception:
+        pass
+_try_set_max_upload(2048)
 
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) Ringkas + Preview")
 st.markdown("""
 <style>
 div[data-testid="stMetricLabel"]{font-size:11px!important}
@@ -22,7 +41,7 @@ div[data-testid="stMetricValue"]{font-size:17px!important}
 </style>
 """, unsafe_allow_html=True)
 
-# ====== Util ======
+# ---------- Utils ----------
 def pyxlsb_ok() -> bool:
     try:
         import pyxlsb  # noqa
@@ -76,7 +95,7 @@ def pick_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
             if h == c or c in h: return i
     return None
 
-# ====== XLSX Writer (untuk download Excel tanpa dependency lain) ======
+# ---------- XLSX Writer (export tanpa dependency lain) ----------
 def _letters(idx: int) -> str:
     s=""; idx+=1
     while idx: idx,r=divmod(idx-1,26); s=chr(65+r)+s
@@ -130,10 +149,10 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
 </styleSheet>''')
         return bio.getvalue()
 
-# ====== Pembaca .xlsb (ringkas & cepat) ======
+# ---------- Pembaca .xlsb (cepat, auto-header) ----------
 def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False):
-    """Yield dict per-baris; header auto; default hanya sheet ke-1 (lebih cepat)."""
-    import pyxlsb  # why: wajib untuk .xlsb
+    """Yield dict per-baris; auto header; default hanya sheet ke-1. Why: lebih cepat."""
+    import pyxlsb  # wajib untuk .xlsb
     file.seek(0); b = file.read()
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
         tmp.write(b); tmp.flush()
@@ -148,13 +167,13 @@ def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False)
                         if header is None:
                             nonempty = [v for v in vals if v.strip()]
                             nums = sum(1 for v in nonempty if numeric_like(v))
-                            header = nonempty if nums <= len(nonempty)//2 else vals  # why: hindari baris numeric jadi header
+                            header = nonempty if nums <= len(nonempty)//2 else vals  # hindari baris numeric sebagai header
                             header = [h.strip() or f"COL{j+1}" for j,h in enumerate(header)]
                             continue
                         vals = vals + [""] * (len(header) - len(vals))
                         yield {header[i]: vals[i] for i in range(len(header))}
             if scan_all_sheets:
-                for i in range(1, 7):  # why: batasi agar tetap cepat
+                for i in range(1, 7):  # batasi agar tetap cepat
                     try:
                         yielded = False
                         for rec in read_sheet(i):
@@ -166,7 +185,7 @@ def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False)
             else:
                 yield from read_sheet(sheet_index)
 
-# ====== UI ======
+# ---------- UI ----------
 with st.sidebar:
     st.header("1) Upload (.xlsb) — multiple")
     inv_files = st.file_uploader("📄 Invoice", type=["xlsb"], accept_multiple_files=True)
@@ -184,7 +203,7 @@ if not inv_files or not ts_files:
     st.info("Unggah minimal satu file **Invoice** dan satu file **T-Summary** (format .xlsb).")
     st.stop()
 
-# ====== Proses ======
+# ---------- Proses ----------
 if st.button("🚀 Proses"):
     agg_inv: Dict[str, float] = {}
     agg_ts:  Dict[str, float] = {}
@@ -268,7 +287,6 @@ if st.button("🚀 Proses"):
             key = coerce_key(vals[key_idx])
             if not key: continue
             agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(vals[amt_idx])
-
             if key not in ts_first["pay_ts"] and pay_idx is not None and vals[pay_idx]: ts_first["pay_ts"][key] = vals[pay_idx]
             def add(store: Dict[str,set], val: str):
                 if val: store.setdefault(key, set()).add(val)
@@ -307,14 +325,13 @@ if st.button("🚀 Proses"):
         total_inv += v_inv; total_ts += v_ts; total_diff += diff
         naik += (cat=="Naik"); turun += (cat=="Turun"); sama += (cat=="Sama")
 
-    # --- Metrik ---
+    # --- Metrik & Preview ---
     m1,m2,m3,m4 = st.columns(4)
     m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
     m2.metric("Total T-Summary (SUMIFS)", format_idr(total_ts))
     m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
     m4.metric("Naik / Turun / Sama", f"{int(naik)} / {int(turun)} / {int(sama)}")
 
-    # --- PREVIEW REKONSILIASI ---
     st.subheader("👀 Preview Rekonsiliasi")
     top_n = st.slider("Tampilkan berapa baris (Top-N)", min_value=10, max_value=1000, value=50, step=10)
     st.dataframe(rows[:top_n], use_container_width=True)
