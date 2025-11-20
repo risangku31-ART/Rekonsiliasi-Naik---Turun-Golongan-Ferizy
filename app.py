@@ -1,6 +1,6 @@
-# file: app_ultralite_diff_option.py
-# Rekonsiliasi Naik/Turun Golongan — .xlsb only, ultra-lite RAM, preview 10 baris
-# Fitur: Checkbox "Hanya tampilkan Selisih ≠ 0" (berlaku untuk preview & export)
+# file: app_ultralite_sheet1_numbers.py
+# Rekonsiliasi Naik/Turun Golongan — Ultra-Lite (.xlsb, Sheet 1), preview 10, filter selisih
+# Export Excel: kolom Nominal & Selisih bertipe NUMBER dengan format #,##0.00
 # Requirements:
 #   streamlit>=1.26
 #   pyxlsb>=1.0.10
@@ -11,34 +11,30 @@ import tempfile
 from typing import Dict, List, Optional
 import streamlit as st
 
-# ---------- Setup UI ----------
-st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Ultra-Lite + Selisih", layout="wide")
+# ---------- Setup ----------
+st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Ultra-Lite (Sheet 1)", layout="wide")
+
 def _try_set_max_upload(mb: int) -> None:
-    try: st.set_option("server.maxUploadSize", int(mb))  # bisa ditolak di runtime; diabaikan jika gagal
+    try: st.set_option("server.maxUploadSize", int(mb))  # why: kalau ditolak runtime, dibiarkan
     except Exception: pass
 _try_set_max_upload(1024)
+
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Ultra-Lite (.xlsb, Sheet 1)")
+st.caption("Baca Sheet 1, auto-header, preview 10 baris, opsi hanya selisih. Export: kolom nominal & selisih = NUMBER.")
+
+# Metric font kecil agar tidak terpotong
 st.markdown("""
 <style>
-/* kecilkan label metric */
-div[data-testid="stMetricLabel"]{
-  font-size:11px !important;
-}
-/* kecilkan value metric & jangan dipotong ellipsis */
+div[data-testid="stMetricLabel"]{font-size:11px!important}
 div[data-testid="stMetricValue"]{
-  font-size:14px !important;         /* sebelumnya 17px */
-  line-height:1.1 !important;
-  white-space: normal !important;     /* boleh pindah baris */
-  word-break: break-all !important;   /* angka panjang bisa di-wrap */
-  overflow-wrap: anywhere !important;
-  text-overflow: clip !important;     /* hilangkan ... */
+  font-size:14px!important; line-height:1.1!important;
+  white-space:normal!important; word-break:break-all!important;
+  overflow-wrap:anywhere!important; text-overflow:clip!important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Ultra-Lite (.xlsb)")
-st.caption("Mode hemat RAM: 1 sheet index, auto-header, preview 10 baris. Tambahan: filter hanya selisih ≠ 0.")
-
-# ---------- Utils (ringkas) ----------
+# ---------- Utils ----------
 def pyxlsb_ok() -> bool:
     try:
         import pyxlsb  # noqa
@@ -97,7 +93,7 @@ def pick_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
             if h == c or c in h: return i
     return None
 
-# ---------- XLSX writer (pure Python, ringan) ----------
+# ---------- XLSX writer (NUMBER support) ----------
 def _letters(idx: int) -> str:
     s=""; idx+=1
     while idx: idx,r=divmod(idx-1,26); s=chr(65+r)+s
@@ -105,21 +101,39 @@ def _letters(idx: int) -> str:
 def _xml(t:str)->str:
     return (t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
              .replace('"',"&quot;").replace("'","&apos;"))
-def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekonsiliasi") -> bytes:
+
+def build_xlsx(columns: List[str], rows: List[Dict[str, object]], sheet_name="Rekonsiliasi",
+               numeric_cols: Optional[List[str]] = None) -> bytes:
+    """
+    numeric_cols: nama kolom yang harus dipaksa NUMBER + style #,##0.00
+    """
     from zipfile import ZipFile
+    numeric_cols = set(numeric_cols or [])
+
+    # worksheet xml
     ws=['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>']
+    # header row
     ws.append('<row r="1">'+"".join(
         f'<c r="{_letters(i)}1" t="inlineStr"><is><t xml:space="preserve">{_xml(c)}</t></is></c>'
         for i,c in enumerate(columns))+ "</row>")
+    # data rows
     r=1
     for row in rows:
         r+=1
-        ws.append(f'<row r="{r}">'+"".join(
-            f'<c r="{_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{_xml(str(row.get(c,'') or ''))}</t></is></c>'
-            for i,c in enumerate(columns))+ "</row>")
+        cells=[]
+        for i,c in enumerate(columns):
+            v = row.get(c, "")
+            if c in numeric_cols and isinstance(v, (int, float)):  # why: agar NUMBER di Excel
+                cells.append(f'<c r="{_letters(i)}{r}" s="1"><v>{v}</v></c>')
+            else:
+                txt = _xml(str(v if v is not None else ""))
+                cells.append(f'<c r="{_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{txt}</t></is></c>')
+        ws.append(f'<row r="{r}">'+"".join(cells)+ "</row>")
     ws.append("</sheetData></worksheet>")
+
+    # build package
     with io.BytesIO() as bio:
         with ZipFile(bio,"w") as z:
             z.writestr("[Content_Types].xml", b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -139,26 +153,37 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
   <sheets><sheet name="{_xml(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>
 </workbook>'''.encode("utf-8"))
             z.writestr("xl/_rels/workbook.xml.rels", b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationships xmlns="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
   <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>''')
             z.writestr("xl/worksheets/sheet1.xml", "\n".join(ws).encode("utf-8"))
+            # styles: s=0 default, s=1 numeric custom (#,##0.00); numFmtId >= 164 untuk custom
             z.writestr("xl/styles.xml", b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders>
-  <cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf xfId="0"/></cellXfs>
+  <numFmts count="1">
+    <numFmt numFmtId="165" formatCode="#,##0.00"/>
+  </numFmts>
+  <fonts count="1"><font/></fonts>
+  <fills count="1"><fill/></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf/></cellStyleXfs>
+  <cellXfs count="2">
+    <xf xfId="0"/>
+    <xf xfId="0" numFmtId="165" applyNumberFormat="1"/>
+  </cellXfs>
 </styleSheet>''')
         return bio.getvalue()
 
-# ---------- XLSB reader (single-sheet, auto-header) ----------
-def iter_records_xlsb(file, sheet_index: int = 1):
+# ---------- XLSB reader (Sheet 1, auto-header) ----------
+def iter_records_xlsb_sheet1(file):
+    """Read hanya Sheet 1; header = baris teks pertama (angka didiskualifikasi)."""
     import pyxlsb  # wajib
     file.seek(0); b = file.read()
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
         tmp.write(b); tmp.flush()
         with pyxlsb.open_workbook(tmp.name) as wb:
-            with wb.get_sheet(sheet_index) as sheet:
+            with wb.get_sheet(1) as sheet:
                 header = None
                 for row in sheet.rows():
                     vals = [str((c.v if c is not None else "") or "") for c in row]
@@ -167,19 +192,18 @@ def iter_records_xlsb(file, sheet_index: int = 1):
                     if header is None:
                         nonempty = [v for v in vals if v.strip()]
                         nums = sum(1 for v in nonempty if numeric_like(v))
-                        header = nonempty if nums <= len(nonempty)//2 else vals  # hindari baris numeric jadi header
+                        header = nonempty if nums <= len(nonempty)//2 else vals
                         header = [h.strip() or f"COL{j+1}" for j,h in enumerate(header)]
                         continue
                     vals = vals + [""] * (len(header) - len(vals))
                     yield {header[i]: vals[i] for i in range(len(header))}
 
-# ---------- Sidebar Upload ----------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("1) Upload (.xlsb) — multiple")
     inv_files = st.file_uploader("📄 Invoice (.xlsb)", type=["xlsb"], accept_multiple_files=True)
     ts_files  = st.file_uploader("🎫 T-Summary (.xlsb)", type=["xlsb"], accept_multiple_files=True)
-    sheet_idx = st.number_input("Index sheet (1-based, dipakai untuk keduanya)", min_value=1, value=1, step=1)
-    only_diff = st.checkbox("Hanya tampilkan Selisih ≠ 0 (juga saat export)", value=False)
+    only_diff = st.checkbox("Hanya tampilkan Selisih ≠ 0 (berlaku untuk preview & export)", value=False)
 
 if not pyxlsb_ok():
     st.error("`pyxlsb` belum terpasang. Tambahkan ke `requirements.txt`:\n\n```\nstreamlit>=1.26\npyxlsb>=1.0.10\n```")
@@ -190,17 +214,16 @@ if not inv_files or not ts_files:
     st.stop()
 
 # ---------- Proses ----------
-if st.button("🚀 Proses (Ultra-Lite)"):
-    # Aggregates
+if st.button("🚀 Proses (Sheet 1)"):
     agg_inv: Dict[str, float] = {}
     agg_ts:  Dict[str, float] = {}
     order: List[str] = []; seen = set()
 
     inv_first = {"tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {}}
-    inv_original: Dict[str, str] = {}  # simpan teks asli 'Nomer Invoice'
-    ts_first  = {"pay_ts": {}, "kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}  # only first values
+    inv_original: Dict[str, str] = {}
+    ts_first  = {"pay_ts": {}, "kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}
 
-    # Kolom non-kunci (fuzzy)
+    # Kandidat non-kunci
     C_INV_AMT = ["harga","nominal","amount","total","nilai"]
     C_INV_TGL = ["tanggal invoice","tgl invoice","tanggal","tgl"]
     C_INV_PAY = ["pembayaran","tgl pembayaran","tanggal pembayaran"]
@@ -220,12 +243,12 @@ if st.button("🚀 Proses (Ultra-Lite)"):
     # Invoice
     for f in inv_files:
         key_idx = amt_idx = tgl_idx = pay_idx = tuj_idx = ch_idx = mer_idx = None
-        for row in iter_records_xlsb(f, sheet_index=sheet_idx):
+        for row in iter_records_xlsb_sheet1(f):
             if key_idx is None:
                 hdr = list(row.keys())
                 key_idx = find_exact_idx_multi(hdr, ["Nomer Invoice", "Nomor Invoice"])
                 if key_idx is None:
-                    st.error(f"Invoice **{f.name}** harus punya header **'Nomer Invoice'** (fallback 'Nomor Invoice').")
+                    st.error(f"Invoice **{f.name}** harus memiliki header **'Nomer Invoice'** (fallback 'Nomor Invoice').")
                     st.stop()
                 amt_idx = pick_col_idx(hdr, C_INV_AMT)
                 tgl_idx = pick_col_idx(hdr, C_INV_TGL)
@@ -234,14 +257,14 @@ if st.button("🚀 Proses (Ultra-Lite)"):
                 ch_idx  = pick_col_idx(hdr, C_INV_CH)
                 mer_idx = pick_col_idx(hdr, C_INV_MER)
                 if amt_idx is None:
-                    st.error(f"Invoice **{f.name}** tidak punya kolom Nominal/Harga yang dikenali.")
+                    st.error(f"Invoice **{f.name}** tidak memiliki kolom Nominal/Harga yang dikenali.")
                     st.stop()
             vals = list(row.values())
             inv_no_raw = vals[key_idx]
             key = coerce_key(inv_no_raw)
             if not key: continue
             if key not in seen: seen.add(key); order.append(key)
-            inv_original.setdefault(key, inv_no_raw)  # only first
+            inv_original.setdefault(key, inv_no_raw)
             agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(vals[amt_idx])
             if tgl_idx is not None and vals[tgl_idx]: inv_first["tgl_inv"].setdefault(key, vals[tgl_idx])
             if pay_idx is not None and vals[pay_idx]: inv_first["pay_inv"].setdefault(key, vals[pay_idx])
@@ -252,7 +275,7 @@ if st.button("🚀 Proses (Ultra-Lite)"):
     # T-Summary
     for f in ts_files:
         key_idx = amt_idx = kode_idx = tkt_idx = pay_idx = gol_idx = asal_idx = ctk_idx = None
-        for row in iter_records_xlsb(f, sheet_index=sheet_idx):
+        for row in iter_records_xlsb_sheet1(f):
             if key_idx is None:
                 hdr = list(row.keys())
                 key_idx  = pick_col_idx(hdr, C_TS_KEY)
@@ -264,7 +287,7 @@ if st.button("🚀 Proses (Ultra-Lite)"):
                 asal_idx = pick_col_idx(hdr, C_TS_ASAL)
                 ctk_idx  = pick_col_idx(hdr, C_TS_CTK)
                 if key_idx is None or amt_idx is None:
-                    st.error(f"T-Summary **{f.name}** tidak punya kolom kunci/nominal yang dikenali.")
+                    st.error(f"T-Summary **{f.name}** tidak memiliki kolom kunci/nominal yang dikenali.")
                     st.stop()
             vals = list(row.values())
             key = coerce_key(vals[key_idx])
@@ -277,8 +300,9 @@ if st.button("🚀 Proses (Ultra-Lite)"):
             if asal_idx is not None and vals[asal_idx]: ts_first["asal" ].setdefault(key, vals[asal_idx])
             if ctk_idx  is not None and vals[ctk_idx ]: ts_first["cetak"].setdefault(key, vals[ctk_idx])
 
-    # Hasil (simpan selisih numerik untuk filter)
-    rows_raw: List[Dict[str,str]] = []
+    # Hasil
+    rows_preview: List[Dict[str, str]] = []
+    rows_export:  List[Dict[str, object]] = []  # kolom nominal/selisih = float
     total_inv = total_ts = total_diff = 0.0
     naik = turun = sama = 0
 
@@ -287,8 +311,9 @@ if st.button("🚀 Proses (Ultra-Lite)"):
         v_ts  = float(agg_ts.get(k, 0.0))
         diff = v_inv - v_ts
         cat = "Turun" if v_inv > v_ts else ("Naik" if v_inv < v_ts else "Sama")
-        rows_raw.append({
-            "__diff__":                      diff,  # internal numeric for filtering
+
+        # preview (string)
+        rows_preview.append({
             "Tanggal Invoice":               inv_first["tgl_inv"].get(k, ""),
             "Nomer Invoice":                 inv_original.get(k, k),
             "Kode Booking":                  ts_first["kode"].get(k, ""),
@@ -306,37 +331,47 @@ if st.button("🚀 Proses (Ultra-Lite)"):
             "Selisih":                       format_idr(diff),
             "Kategori":                      cat,
         })
+
+        # export (number)
+        rows_export.append({
+            "Tanggal Invoice":               inv_first["tgl_inv"].get(k, ""),
+            "Nomer Invoice":                 inv_original.get(k, k),
+            "Kode Booking":                  ts_first["kode"].get(k, ""),
+            "Nomor Tiket":                   ts_first["tiket"].get(k, ""),
+            "Nominal Invoice":               v_inv,     # NUMBER
+            "Tanggal Pembayaran Invoice":    inv_first["pay_inv"].get(k, ""),
+            "Nominal T-Summary":             v_ts,      # NUMBER
+            "Tanggal Pembayaran T-Summary":  ts_first["pay_ts"].get(k, ""),
+            "Golongan":                      ts_first["gol"].get(k, ""),
+            "Keberangkatan":                 ts_first["asal"].get(k, ""),
+            "Tujuan":                        inv_first["tujuan"].get(k, ""),
+            "Tgl Cetak Boarding Pass":       ts_first["cetak"].get(k, ""),
+            "Channel":                       inv_first["channel"].get(k, ""),
+            "Merchant":                      inv_first["merchant"].get(k, ""),
+            "Selisih":                       diff,      # NUMBER
+            "Kategori":                      cat,
+        })
+
         total_inv += v_inv; total_ts += v_ts; total_diff += diff
         naik += (cat=="Naik"); turun += (cat=="Turun"); sama += (cat=="Sama")
 
-    # Filter selisih jika diminta
-    def _strip_internal(rows: List[Dict[str,str]]) -> List[Dict[str,str]]:
-        out = []
-        for r in rows:
-            if "__diff__" in r:
-                r = dict(r)  # copy ringan
-                r.pop("__diff__", None)
-            out.append(r)
-        return out
-
-    rows_to_use = rows_raw
+    # Terapkan filter "Hanya Selisih ≠ 0" ke preview & export
     if only_diff:
-        rows_to_use = [r for r in rows_raw if abs(float(r.get("__diff__", 0.0))) > 0.0]
+        rows_preview = [r for r,e in zip(rows_preview, rows_export) if abs(float(e["Selisih"])) > 0.0]
+        rows_export  = [e for e in rows_export if abs(float(e["Selisih"])) > 0.0]
 
-    rows = _strip_internal(rows_to_use)
-
-    # Metrics (total keseluruhan, bukan filtered)
+    # Metrics (total keseluruhan)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Invoice", format_idr(total_inv))
     c2.metric("Total T-Summary", format_idr(total_ts))
     c3.metric("Total Selisih (Inv−T)", format_idr(total_diff))
     c4.metric("Naik / Turun / Sama", f"{int(naik)} / {int(turun)} / {int(sama)}")
 
-    # Preview 10 baris (fixed)
+    # Preview 10 baris
     st.subheader("👀 Preview 10 baris" + (" — hanya Selisih ≠ 0" if only_diff else ""))
-    st.dataframe(rows[:10], use_container_width=True)
+    st.dataframe(rows_preview[:10], use_container_width=True)
 
-    # Download Excel (terapkan filter yang sama)
+    # Download Excel: kolom nominal & selisih = NUMBER + style #,##0.00
     cols = [
         "Tanggal Invoice","Nomer Invoice","Kode Booking","Nomor Tiket",
         "Nominal Invoice","Tanggal Pembayaran Invoice",
@@ -344,7 +379,15 @@ if st.button("🚀 Proses (Ultra-Lite)"):
         "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
         "Channel","Merchant","Selisih","Kategori",
     ]
-    xlsx = build_xlsx(cols, rows, sheet_name="Rekonsiliasi")
-    st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx,
-                       file_name=("rekonsiliasi_ultralite_selisih.xlsx" if only_diff else "rekonsiliasi_ultralite.xlsx"),
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    xlsx = build_xlsx(
+        columns=cols,
+        rows=rows_export,
+        sheet_name="Rekonsiliasi",
+        numeric_cols=["Nominal Invoice","Nominal T-Summary","Selisih"]
+    )
+    st.download_button(
+        "⬇️ Download Excel (.xlsx)",
+        data=xlsx,
+        file_name=("rekonsiliasi_ultralite_selisih.xlsx" if only_diff else "rekonsiliasi_ultralite.xlsx"),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
