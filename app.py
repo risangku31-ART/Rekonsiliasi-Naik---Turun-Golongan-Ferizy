@@ -1,8 +1,8 @@
 # =========================
 # file: app.py
 # =========================
-# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — kunci: "Nomer Invoice" (Invoice)
-# Requirements minimal:
+# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — Preview 10 baris & kolom nominal/tanggal dipisah
+# Requirements:
 #   streamlit>=1.26
 #   pyxlsb>=1.0.10
 
@@ -13,17 +13,17 @@ from typing import Dict, List, Optional
 import streamlit as st
 
 # ---------- Page ----------
-st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Nomer Invoice", layout="wide")
+st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Preview 10 & Kolom Dipisah", layout="wide")
 
 def _try_set_max_upload(mb: int) -> None:
-    # why: beberapa env tidak mengizinkan server.* diubah saat runtime; jangan bikin crash
+    # why: beberapa env blokir set_option server.* saat runtime — jangan bikin crash
     try:
         st.set_option("server.maxUploadSize", int(mb))
     except Exception:
         pass
 _try_set_max_upload(2048)
 
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) | Kunci: 'Nomer Invoice' (Invoice)")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) | Nomer Invoice exact")
 st.markdown("""
 <style>
 div[data-testid="stMetricLabel"]{font-size:11px!important}
@@ -86,7 +86,6 @@ def pick_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
     return None
 
 def find_exact_idx_multi(headers: List[str], exact_names: List[str]) -> Optional[int]:
-    """Why: kunci harus persis 'Nomer Invoice' (fallback 'Nomor Invoice')."""
     targets = {norm(x) for x in exact_names}
     for i, h in enumerate(headers):
         if norm(h) in targets:
@@ -117,7 +116,6 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
             for i,c in enumerate(columns))+ "</row>")
     ws.append("</sheetData></worksheet>")
     with io.BytesIO() as bio:
-        from zipfile import ZipFile
         with ZipFile(bio,"w") as z:
             z.writestr("[Content_Types].xml", b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -150,7 +148,7 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
 
 # ---------- Pembaca .xlsb (cepat, auto-header) ----------
 def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False):
-    """Yield dict per-baris; auto header; default hanya sheet ke-1. (Why: kinerja)"""
+    """Yield dict per-baris; auto header; default hanya sheet ke-1 (lebih cepat)."""
     import pyxlsb  # wajib untuk .xlsb
     file.seek(0); b = file.read()
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
@@ -166,7 +164,7 @@ def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False)
                         if header is None:
                             nonempty = [v for v in vals if v.strip()]
                             nums = sum(1 for v in nonempty if numeric_like(v))
-                            header = nonempty if nums <= len(nonempty)//2 else vals
+                            header = nonempty if nums <= len(nonempty)//2 else vals  # why: hindari baris numeric jadi header
                             header = [h.strip() or f"COL{j+1}" for j,h in enumerate(header)]
                             continue
                         vals = vals + [""] * (len(header) - len(vals))
@@ -209,7 +207,7 @@ if st.button("🚀 Proses"):
     order: List[str] = []; seen = set()
 
     inv_first = {"tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {}}
-    inv_original: Dict[str, str] = {}  # why: tampilkan 'Nomer Invoice' asli
+    inv_original: Dict[str, str] = {}  # tampilkan nilai 'Nomer Invoice' asli
     ts_first  = {"pay_ts": {}}
     ts_join   = {"kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}
 
@@ -240,11 +238,9 @@ if st.button("🚀 Proses"):
         for row in iter_records_xlsb(f, sheet_index=sheet_idx, scan_all_sheets=scan_all):
             if key_idx is None:
                 hdr = list(row.keys())
-                # PRIORITAS 'Nomer Invoice', fallback 'Nomor Invoice'
                 key_idx = find_exact_idx_multi(hdr, ["Nomer Invoice", "Nomor Invoice"])
                 if key_idx is None:
-                    st.error(f"File Invoice **{f.name}** harus memiliki header **'Nomer Invoice'** "
-                             f"(fallback: 'Nomor Invoice').")
+                    st.error(f"File Invoice **{f.name}** harus memiliki header **'Nomer Invoice'** (fallback: 'Nomor Invoice').")
                     st.stop()
                 amt_idx = pick_col_idx(hdr, C_INV_AMT)
                 tgl_idx = pick_col_idx(hdr, C_INV_TGL)
@@ -299,7 +295,7 @@ if st.button("🚀 Proses"):
             add(ts_join["asal"],  vals[asal_idx] if asal_idx is not None else "")
             add(ts_join["cetak"], vals[ctk_idx]  if ctk_idx  is not None else "")
 
-    # --- Hasil ---
+    # --- Susun hasil (kolom nominal & tanggal dipisah) ---
     rows: List[Dict[str,str]] = []
     total_inv = total_ts = total_diff = 0.0
     naik = turun = sama = 0
@@ -310,25 +306,27 @@ if st.button("🚀 Proses"):
         diff = v_inv - v_ts
         cat = "Turun" if v_inv > v_ts else ("Naik" if v_inv < v_ts else "Sama")
         rows.append({
-            "Tanggal Invoice":              inv_first["tgl_inv"].get(k, ""),
-            "Nomer Invoice":                inv_original.get(k, k),  # tampilkan header sesuai ralat
-            "Kode Booking":                 ", ".join(sorted(ts_join["kode"].get(k, set()))),
-            "Nomor Tiket":                  ", ".join(sorted(ts_join["tiket"].get(k, set()))),
-            "Invoice (Nominal; Tgl Bayar)": f"{format_idr(v_inv)}; {inv_first['pay_inv'].get(k, '')}",
-            "T-Summary (Nominal; Tgl Bayar)": f"{format_idr(v_ts)}; {ts_first['pay_ts'].get(k, '')}",
-            "Golongan":                     ", ".join(sorted(ts_join["gol"].get(k, set()))),
-            "Keberangkatan":                ", ".join(sorted(ts_join["asal"].get(k, set()))),
-            "Tujuan":                       inv_first["tujuan"].get(k, ""),
-            "Tgl Cetak Boarding Pass":      ", ".join(sorted(ts_join["cetak"].get(k, set()))),
-            "Channel":                      inv_first["channel"].get(k, ""),
-            "Merchant":                     inv_first["merchant"].get(k, ""),
-            "Selisih":                      format_idr(diff),
-            "Kategori":                     cat,
+            "Tanggal Invoice":                inv_first["tgl_inv"].get(k, ""),
+            "Nomer Invoice":                  inv_original.get(k, k),
+            "Kode Booking":                   ", ".join(sorted(ts_join["kode"].get(k, set()))),
+            "Nomor Tiket":                    ", ".join(sorted(ts_join["tiket"].get(k, set()))),
+            "Nominal Invoice":                format_idr(v_inv),
+            "Tanggal Pembayaran Invoice":     inv_first["pay_inv"].get(k, ""),
+            "Nominal T-Summary":              format_idr(v_ts),
+            "Tanggal Pembayaran T-Summary":   ts_first["pay_ts"].get(k, ""),
+            "Golongan":                       ", ".join(sorted(ts_join["gol"].get(k, set()))),
+            "Keberangkatan":                  ", ".join(sorted(ts_join["asal"].get(k, set()))),
+            "Tujuan":                         inv_first["tujuan"].get(k, ""),
+            "Tgl Cetak Boarding Pass":        ", ".join(sorted(ts_join["cetak"].get(k, set()))),
+            "Channel":                        inv_first["channel"].get(k, ""),
+            "Merchant":                       inv_first["merchant"].get(k, ""),
+            "Selisih":                        format_idr(diff),
+            "Kategori":                       cat,
         })
         total_inv += v_inv; total_ts += v_ts; total_diff += diff
         naik += (cat=="Naik"); turun += (cat=="Turun"); sama += (cat=="Sama")
 
-    # --- Metrik & Preview ---
+    # --- Metrik & Preview (default 10 baris) ---
     m1,m2,m3,m4 = st.columns(4)
     m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
     m2.metric("Total T-Summary (SUMIFS)", format_idr(total_ts))
@@ -336,13 +334,14 @@ if st.button("🚀 Proses"):
     m4.metric("Naik / Turun / Sama", f"{int(naik)} / {int(turun)} / {int(sama)}")
 
     st.subheader("👀 Preview Rekonsiliasi")
-    top_n = st.slider("Tampilkan berapa baris (Top-N)", min_value=10, max_value=1000, value=50, step=10)
+    top_n = st.slider("Tampilkan berapa baris (Top-N)", min_value=10, max_value=1000, value=10, step=10)  # default 10
     st.dataframe(rows[:top_n], use_container_width=True)
 
-    # --- Download Excel ---
+    # --- Download Excel (kolom terurut) ---
     cols = [
         "Tanggal Invoice","Nomer Invoice","Kode Booking","Nomor Tiket",
-        "Invoice (Nominal; Tgl Bayar)","T-Summary (Nominal; Tgl Bayar)",
+        "Nominal Invoice","Tanggal Pembayaran Invoice",
+        "Nominal T-Summary","Tanggal Pembayaran T-Summary",
         "Golongan","Keberangkatan","Tujuan","Tgl Cetak Boarding Pass",
         "Channel","Merchant","Selisih","Kategori",
     ]
@@ -350,6 +349,6 @@ if st.button("🚀 Proses"):
     st.download_button(
         "⬇️ Download Excel (.xlsx)",
         data=xlsx,
-        file_name="rekonsiliasi_nomer_invoice.xlsx",
+        file_name="rekonsiliasi_preview_10_split.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
