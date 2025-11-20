@@ -17,6 +17,23 @@ def _try_set_max_upload(mb: int) -> None:
     try: st.set_option("server.maxUploadSize", int(mb))  # bisa ditolak di runtime; diabaikan jika gagal
     except Exception: pass
 _try_set_max_upload(1024)
+st.markdown("""
+<style>
+/* kecilkan label metric */
+div[data-testid="stMetricLabel"]{
+  font-size:11px !important;
+}
+/* kecilkan value metric & jangan dipotong ellipsis */
+div[data-testid="stMetricValue"]{
+  font-size:14px !important;         /* sebelumnya 17px */
+  line-height:1.1 !important;
+  white-space: normal !important;     /* boleh pindah baris */
+  word-break: break-all !important;   /* angka panjang bisa di-wrap */
+  overflow-wrap: anywhere !important;
+  text-overflow: clip !important;     /* hilangkan ... */
+}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Ultra-Lite (.xlsb)")
 st.caption("Mode hemat RAM: 1 sheet index, auto-header, preview 10 baris. Tambahan: filter hanya selisih ≠ 0.")
