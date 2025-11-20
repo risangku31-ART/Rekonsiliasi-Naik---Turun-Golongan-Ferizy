@@ -1,7 +1,6 @@
-# =========================
-# file: app.py
-# =========================
-# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — Preview 10 baris & kolom nominal/tanggal dipisah
+# file: app_ultralite_diff_option.py
+# Rekonsiliasi Naik/Turun Golongan — .xlsb only, ultra-lite RAM, preview 10 baris
+# Fitur: Checkbox "Hanya tampilkan Selisih ≠ 0" (berlaku untuk preview & export)
 # Requirements:
 #   streamlit>=1.26
 #   pyxlsb>=1.0.10
@@ -12,32 +11,34 @@ import tempfile
 from typing import Dict, List, Optional
 import streamlit as st
 
-# ---------- Page ----------
-st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Preview 10 & Kolom Dipisah", layout="wide")
-
+# ---------- Setup UI ----------
+st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Ultra-Lite + Selisih", layout="wide")
 def _try_set_max_upload(mb: int) -> None:
-    # why: beberapa env blokir set_option server.* saat runtime — jangan bikin crash
-    try:
-        st.set_option("server.maxUploadSize", int(mb))
-    except Exception:
-        pass
-_try_set_max_upload(2048)
+    try: st.set_option("server.maxUploadSize", int(mb))  # bisa ditolak di runtime; diabaikan jika gagal
+    except Exception: pass
+_try_set_max_upload(1024)
 
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) | Nomer Invoice exact")
-st.markdown("""
-<style>
-div[data-testid="stMetricLabel"]{font-size:11px!important}
-div[data-testid="stMetricValue"]{font-size:17px!important}
-</style>
-""", unsafe_allow_html=True)
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — Ultra-Lite (.xlsb)")
+st.caption("Mode hemat RAM: 1 sheet index, auto-header, preview 10 baris. Tambahan: filter hanya selisih ≠ 0.")
 
-# ---------- Utils ----------
+# ---------- Utils (ringkas) ----------
 def pyxlsb_ok() -> bool:
     try:
         import pyxlsb  # noqa
         return True
     except Exception:
         return False
+
+def norm(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return (s.replace("no ", "nomor ").replace("no", "nomor")
+             .replace("inv", "invoice").replace("harga total", "harga")
+             .replace("nilai", "harga").replace("tarip", "tarif"))
+
+def numeric_like(v: str) -> bool:
+    return bool(re.fullmatch(r"\s*[\d\.\,\-\(\)]+(\s*)", str(v or "")))
 
 def parse_money(x: str) -> float:
     if x is None: return 0.0
@@ -62,37 +63,24 @@ def format_idr(n: float) -> str:
     s = f"{float(n):,.2f}"
     return s.replace(",", "_").replace(".", ",").replace("_", ".")
 
-def norm(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return (s.replace("no ", "nomor ").replace("no", "nomor")
-             .replace("inv", "invoice").replace("harga total", "harga")
-             .replace("nilai", "harga").replace("tarip", "tarif"))
-
 def coerce_key(x: str) -> str:
     return re.sub(r"\s+", "", (x or "")).upper()
-
-def numeric_like(v: str) -> bool:
-    return bool(re.fullmatch(r"\s*[\d\.\,\-\(\)]+(\s*)", str(v or "")))
-
-def pick_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
-    if not headers: return None
-    H = {i: norm(h) for i, h in enumerate(headers)}
-    C = [norm(c) for c in candidates]
-    for c in C:
-        for i, h in H.items():
-            if h == c or c in h: return i
-    return None
 
 def find_exact_idx_multi(headers: List[str], exact_names: List[str]) -> Optional[int]:
     targets = {norm(x) for x in exact_names}
     for i, h in enumerate(headers):
-        if norm(h) in targets:
-            return i
+        if norm(h) in targets: return i
     return None
 
-# ---------- XLSX Writer (export tanpa dependency lain) ----------
+def pick_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
+    if not headers: return None
+    H = {i: norm(h) for i, h in enumerate(headers)}
+    for c in [norm(c) for c in candidates]:
+        for i, h in H.items():
+            if h == c or c in h: return i
+    return None
+
+# ---------- XLSX writer (pure Python, ringan) ----------
 def _letters(idx: int) -> str:
     s=""; idx+=1
     while idx: idx,r=divmod(idx-1,26); s=chr(65+r)+s
@@ -112,7 +100,7 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
     for row in rows:
         r+=1
         ws.append(f'<row r="{r}">'+"".join(
-            f'<c r="{_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{_xml(str(row.get(c,"") or ""))}</t></is></c>'
+            f'<c r="{_letters(i)}{r}" t="inlineStr"><is><t xml:space="preserve">{_xml(str(row.get(c,'') or ''))}</t></is></c>'
             for i,c in enumerate(columns))+ "</row>")
     ws.append("</sheetData></worksheet>")
     with io.BytesIO() as bio:
@@ -146,76 +134,56 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
 </styleSheet>''')
         return bio.getvalue()
 
-# ---------- Pembaca .xlsb (cepat, auto-header) ----------
-def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False):
-    """Yield dict per-baris; auto header; default hanya sheet ke-1 (lebih cepat)."""
-    import pyxlsb  # wajib untuk .xlsb
+# ---------- XLSB reader (single-sheet, auto-header) ----------
+def iter_records_xlsb(file, sheet_index: int = 1):
+    import pyxlsb  # wajib
     file.seek(0); b = file.read()
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
         tmp.write(b); tmp.flush()
         with pyxlsb.open_workbook(tmp.name) as wb:
-            def read_sheet(sh):
-                with wb.get_sheet(sh) as sheet:
-                    header = None
-                    for row in sheet.rows():
-                        vals = [str((c.v if c is not None else "") or "") for c in row]
-                        if not any(v.strip() for v in vals):
-                            continue
-                        if header is None:
-                            nonempty = [v for v in vals if v.strip()]
-                            nums = sum(1 for v in nonempty if numeric_like(v))
-                            header = nonempty if nums <= len(nonempty)//2 else vals  # why: hindari baris numeric jadi header
-                            header = [h.strip() or f"COL{j+1}" for j,h in enumerate(header)]
-                            continue
-                        vals = vals + [""] * (len(header) - len(vals))
-                        yield {header[i]: vals[i] for i in range(len(header))}
-            if scan_all_sheets:
-                for i in range(1, 7):  # batasi agar tetap cepat
-                    try:
-                        yielded = False
-                        for rec in read_sheet(i):
-                            yielded = True
-                            yield rec
-                        if yielded: break
-                    except Exception:
+            with wb.get_sheet(sheet_index) as sheet:
+                header = None
+                for row in sheet.rows():
+                    vals = [str((c.v if c is not None else "") or "") for c in row]
+                    if not any(v.strip() for v in vals):
                         continue
-            else:
-                yield from read_sheet(sheet_index)
+                    if header is None:
+                        nonempty = [v for v in vals if v.strip()]
+                        nums = sum(1 for v in nonempty if numeric_like(v))
+                        header = nonempty if nums <= len(nonempty)//2 else vals  # hindari baris numeric jadi header
+                        header = [h.strip() or f"COL{j+1}" for j,h in enumerate(header)]
+                        continue
+                    vals = vals + [""] * (len(header) - len(vals))
+                    yield {header[i]: vals[i] for i in range(len(header))}
 
-# ---------- UI ----------
+# ---------- Sidebar Upload ----------
 with st.sidebar:
     st.header("1) Upload (.xlsb) — multiple")
-    inv_files = st.file_uploader("📄 Invoice", type=["xlsb"], accept_multiple_files=True)
-    ts_files  = st.file_uploader("🎫 T-Summary", type=["xlsb"], accept_multiple_files=True)
-    st.divider()
-    st.subheader("Mode Baca (cepat)")
-    sheet_idx = st.number_input("Index sheet (1-based)", min_value=1, value=1, step=1)
-    scan_all  = st.checkbox("Cek semua sheet (lebih lambat)", value=False)
+    inv_files = st.file_uploader("📄 Invoice (.xlsb)", type=["xlsb"], accept_multiple_files=True)
+    ts_files  = st.file_uploader("🎫 T-Summary (.xlsb)", type=["xlsb"], accept_multiple_files=True)
+    sheet_idx = st.number_input("Index sheet (1-based, dipakai untuk keduanya)", min_value=1, value=1, step=1)
+    only_diff = st.checkbox("Hanya tampilkan Selisih ≠ 0 (juga saat export)", value=False)
 
 if not pyxlsb_ok():
     st.error("`pyxlsb` belum terpasang. Tambahkan ke `requirements.txt`:\n\n```\nstreamlit>=1.26\npyxlsb>=1.0.10\n```")
     st.stop()
 
 if not inv_files or not ts_files:
-    st.info("Unggah minimal satu file **Invoice** dan satu file **T-Summary** (format .xlsb).")
+    st.info("Unggah minimal satu file **Invoice** dan satu file **T-Summary** (.xlsb).")
     st.stop()
 
 # ---------- Proses ----------
-if st.button("🚀 Proses"):
+if st.button("🚀 Proses (Ultra-Lite)"):
+    # Aggregates
     agg_inv: Dict[str, float] = {}
     agg_ts:  Dict[str, float] = {}
     order: List[str] = []; seen = set()
 
     inv_first = {"tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {}}
-    inv_original: Dict[str, str] = {}  # tampilkan nilai 'Nomer Invoice' asli
-    ts_first  = {"pay_ts": {}}
-    ts_join   = {"kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}
+    inv_original: Dict[str, str] = {}  # simpan teks asli 'Nomer Invoice'
+    ts_first  = {"pay_ts": {}, "kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}  # only first values
 
-    def add_join(store: Dict[str, set], k: str, v: str):
-        if not v: return
-        store.setdefault(k, set()).add(v)
-
-    # Kandidat non-kunci
+    # Kolom non-kunci (fuzzy)
     C_INV_AMT = ["harga","nominal","amount","total","nilai"]
     C_INV_TGL = ["tanggal invoice","tgl invoice","tanggal","tgl"]
     C_INV_PAY = ["pembayaran","tgl pembayaran","tanggal pembayaran"]
@@ -223,7 +191,7 @@ if st.button("🚀 Proses"):
     C_INV_CH  = ["channel"]
     C_INV_MER = ["merchant","mid"]
 
-    C_TS_KEY  = ["nomer invoice","nomor invoice","no invoice","invoice"]  # fleksibel di T-Summary
+    C_TS_KEY  = ["nomer invoice","nomor invoice","no invoice","invoice"]
     C_TS_AMT  = ["tarif","harga","nominal","amount","total","nilai"]
     C_TS_KODE = ["kode booking","kode boking","booking"]
     C_TS_TKT  = ["nomor tiket","no tiket","ticket"]
@@ -232,15 +200,15 @@ if st.button("🚀 Proses"):
     C_TS_ASAL = ["asal","keberangkatan"]
     C_TS_CTK  = ["cetak boarding pass","tgl cetak"]
 
-    # --- Invoice (kunci WAJIB: 'Nomer Invoice'; fallback 'Nomor Invoice') ---
+    # Invoice
     for f in inv_files:
         key_idx = amt_idx = tgl_idx = pay_idx = tuj_idx = ch_idx = mer_idx = None
-        for row in iter_records_xlsb(f, sheet_index=sheet_idx, scan_all_sheets=scan_all):
+        for row in iter_records_xlsb(f, sheet_index=sheet_idx):
             if key_idx is None:
                 hdr = list(row.keys())
                 key_idx = find_exact_idx_multi(hdr, ["Nomer Invoice", "Nomor Invoice"])
                 if key_idx is None:
-                    st.error(f"File Invoice **{f.name}** harus memiliki header **'Nomer Invoice'** (fallback: 'Nomor Invoice').")
+                    st.error(f"Invoice **{f.name}** harus punya header **'Nomer Invoice'** (fallback 'Nomor Invoice').")
                     st.stop()
                 amt_idx = pick_col_idx(hdr, C_INV_AMT)
                 tgl_idx = pick_col_idx(hdr, C_INV_TGL)
@@ -249,26 +217,25 @@ if st.button("🚀 Proses"):
                 ch_idx  = pick_col_idx(hdr, C_INV_CH)
                 mer_idx = pick_col_idx(hdr, C_INV_MER)
                 if amt_idx is None:
-                    st.error(f"File Invoice **{f.name}** tidak memiliki kolom Nominal/Harga yang dikenali.")
+                    st.error(f"Invoice **{f.name}** tidak punya kolom Nominal/Harga yang dikenali.")
                     st.stop()
             vals = list(row.values())
             inv_no_raw = vals[key_idx]
             key = coerce_key(inv_no_raw)
             if not key: continue
             if key not in seen: seen.add(key); order.append(key)
-            if key not in inv_original: inv_original[key] = inv_no_raw
-
+            inv_original.setdefault(key, inv_no_raw)  # only first
             agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(vals[amt_idx])
-            if key not in inv_first["tgl_inv"] and tgl_idx is not None and vals[tgl_idx]: inv_first["tgl_inv"][key] = vals[tgl_idx]
-            if key not in inv_first["pay_inv"] and pay_idx is not None and vals[pay_idx]: inv_first["pay_inv"][key] = vals[pay_idx]
-            if key not in inv_first["tujuan"]  and tuj_idx is not None and vals[tuj_idx]: inv_first["tujuan"][key]  = vals[tuj_idx]
-            if key not in inv_first["channel"] and ch_idx  is not None and vals[ch_idx]:  inv_first["channel"][key] = vals[ch_idx]
-            if key not in inv_first["merchant"]and mer_idx is not None and vals[mer_idx]: inv_first["merchant"][key]= vals[mer_idx]
+            if tgl_idx is not None and vals[tgl_idx]: inv_first["tgl_inv"].setdefault(key, vals[tgl_idx])
+            if pay_idx is not None and vals[pay_idx]: inv_first["pay_inv"].setdefault(key, vals[pay_idx])
+            if tuj_idx is not None and vals[tuj_idx]: inv_first["tujuan"].setdefault(key, vals[tuj_idx])
+            if ch_idx  is not None and vals[ch_idx ]: inv_first["channel"].setdefault(key, vals[ch_idx])
+            if mer_idx is not None and vals[mer_idx]: inv_first["merchant"].setdefault(key, vals[mer_idx])
 
-    # --- T-Summary (kunci fleksibel) ---
+    # T-Summary
     for f in ts_files:
         key_idx = amt_idx = kode_idx = tkt_idx = pay_idx = gol_idx = asal_idx = ctk_idx = None
-        for row in iter_records_xlsb(f, sheet_index=sheet_idx, scan_all_sheets=scan_all):
+        for row in iter_records_xlsb(f, sheet_index=sheet_idx):
             if key_idx is None:
                 hdr = list(row.keys())
                 key_idx  = pick_col_idx(hdr, C_TS_KEY)
@@ -280,23 +247,21 @@ if st.button("🚀 Proses"):
                 asal_idx = pick_col_idx(hdr, C_TS_ASAL)
                 ctk_idx  = pick_col_idx(hdr, C_TS_CTK)
                 if key_idx is None or amt_idx is None:
-                    st.error(f"File T-Summary **{f.name}** tidak memiliki kolom kunci/Nominal yang dikenali.")
+                    st.error(f"T-Summary **{f.name}** tidak punya kolom kunci/nominal yang dikenali.")
                     st.stop()
             vals = list(row.values())
             key = coerce_key(vals[key_idx])
             if not key: continue
             agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(vals[amt_idx])
-            if key not in ts_first["pay_ts"] and pay_idx is not None and vals[pay_idx]: ts_first["pay_ts"][key] = vals[pay_idx]
-            def add(store: Dict[str,set], val: str):
-                if val: store.setdefault(key, set()).add(val)
-            add(ts_join["kode"],  vals[kode_idx] if kode_idx is not None else "")
-            add(ts_join["tiket"], vals[tkt_idx]  if tkt_idx  is not None else "")
-            add(ts_join["gol"],   vals[gol_idx]  if gol_idx  is not None else "")
-            add(ts_join["asal"],  vals[asal_idx] if asal_idx is not None else "")
-            add(ts_join["cetak"], vals[ctk_idx]  if ctk_idx  is not None else "")
+            if pay_idx  is not None and vals[pay_idx ]: ts_first["pay_ts"].setdefault(key, vals[pay_idx])
+            if kode_idx is not None and vals[kode_idx]: ts_first["kode" ].setdefault(key, vals[kode_idx])
+            if tkt_idx  is not None and vals[tkt_idx ]: ts_first["tiket"].setdefault(key, vals[tkt_idx])
+            if gol_idx  is not None and vals[gol_idx ]: ts_first["gol"  ].setdefault(key, vals[gol_idx])
+            if asal_idx is not None and vals[asal_idx]: ts_first["asal" ].setdefault(key, vals[asal_idx])
+            if ctk_idx  is not None and vals[ctk_idx ]: ts_first["cetak"].setdefault(key, vals[ctk_idx])
 
-    # --- Susun hasil (kolom nominal & tanggal dipisah) ---
-    rows: List[Dict[str,str]] = []
+    # Hasil (simpan selisih numerik untuk filter)
+    rows_raw: List[Dict[str,str]] = []
     total_inv = total_ts = total_diff = 0.0
     naik = turun = sama = 0
 
@@ -305,39 +270,56 @@ if st.button("🚀 Proses"):
         v_ts  = float(agg_ts.get(k, 0.0))
         diff = v_inv - v_ts
         cat = "Turun" if v_inv > v_ts else ("Naik" if v_inv < v_ts else "Sama")
-        rows.append({
-            "Tanggal Invoice":                inv_first["tgl_inv"].get(k, ""),
-            "Nomer Invoice":                  inv_original.get(k, k),
-            "Kode Booking":                   ", ".join(sorted(ts_join["kode"].get(k, set()))),
-            "Nomor Tiket":                    ", ".join(sorted(ts_join["tiket"].get(k, set()))),
-            "Nominal Invoice":                format_idr(v_inv),
-            "Tanggal Pembayaran Invoice":     inv_first["pay_inv"].get(k, ""),
-            "Nominal T-Summary":              format_idr(v_ts),
-            "Tanggal Pembayaran T-Summary":   ts_first["pay_ts"].get(k, ""),
-            "Golongan":                       ", ".join(sorted(ts_join["gol"].get(k, set()))),
-            "Keberangkatan":                  ", ".join(sorted(ts_join["asal"].get(k, set()))),
-            "Tujuan":                         inv_first["tujuan"].get(k, ""),
-            "Tgl Cetak Boarding Pass":        ", ".join(sorted(ts_join["cetak"].get(k, set()))),
-            "Channel":                        inv_first["channel"].get(k, ""),
-            "Merchant":                       inv_first["merchant"].get(k, ""),
-            "Selisih":                        format_idr(diff),
-            "Kategori":                       cat,
+        rows_raw.append({
+            "__diff__":                      diff,  # internal numeric for filtering
+            "Tanggal Invoice":               inv_first["tgl_inv"].get(k, ""),
+            "Nomer Invoice":                 inv_original.get(k, k),
+            "Kode Booking":                  ts_first["kode"].get(k, ""),
+            "Nomor Tiket":                   ts_first["tiket"].get(k, ""),
+            "Nominal Invoice":               format_idr(v_inv),
+            "Tanggal Pembayaran Invoice":    inv_first["pay_inv"].get(k, ""),
+            "Nominal T-Summary":             format_idr(v_ts),
+            "Tanggal Pembayaran T-Summary":  ts_first["pay_ts"].get(k, ""),
+            "Golongan":                      ts_first["gol"].get(k, ""),
+            "Keberangkatan":                 ts_first["asal"].get(k, ""),
+            "Tujuan":                        inv_first["tujuan"].get(k, ""),
+            "Tgl Cetak Boarding Pass":       ts_first["cetak"].get(k, ""),
+            "Channel":                       inv_first["channel"].get(k, ""),
+            "Merchant":                      inv_first["merchant"].get(k, ""),
+            "Selisih":                       format_idr(diff),
+            "Kategori":                      cat,
         })
         total_inv += v_inv; total_ts += v_ts; total_diff += diff
         naik += (cat=="Naik"); turun += (cat=="Turun"); sama += (cat=="Sama")
 
-    # --- Metrik & Preview (default 10 baris) ---
-    m1,m2,m3,m4 = st.columns(4)
-    m1.metric("Total Invoice (SUMIFS)", format_idr(total_inv))
-    m2.metric("Total T-Summary (SUMIFS)", format_idr(total_ts))
-    m3.metric("Total Selisih (Inv − T)", format_idr(total_diff))
-    m4.metric("Naik / Turun / Sama", f"{int(naik)} / {int(turun)} / {int(sama)}")
+    # Filter selisih jika diminta
+    def _strip_internal(rows: List[Dict[str,str]]) -> List[Dict[str,str]]:
+        out = []
+        for r in rows:
+            if "__diff__" in r:
+                r = dict(r)  # copy ringan
+                r.pop("__diff__", None)
+            out.append(r)
+        return out
 
-    st.subheader("👀 Preview Rekonsiliasi")
-    top_n = st.slider("Tampilkan berapa baris (Top-N)", min_value=10, max_value=1000, value=10, step=10)  # default 10
-    st.dataframe(rows[:top_n], use_container_width=True)
+    rows_to_use = rows_raw
+    if only_diff:
+        rows_to_use = [r for r in rows_raw if abs(float(r.get("__diff__", 0.0))) > 0.0]
 
-    # --- Download Excel (kolom terurut) ---
+    rows = _strip_internal(rows_to_use)
+
+    # Metrics (total keseluruhan, bukan filtered)
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Total Invoice", format_idr(total_inv))
+    c2.metric("Total T-Summary", format_idr(total_ts))
+    c3.metric("Total Selisih (Inv−T)", format_idr(total_diff))
+    c4.metric("Naik / Turun / Sama", f"{int(naik)} / {int(turun)} / {int(sama)}")
+
+    # Preview 10 baris (fixed)
+    st.subheader("👀 Preview 10 baris" + (" — hanya Selisih ≠ 0" if only_diff else ""))
+    st.dataframe(rows[:10], use_container_width=True)
+
+    # Download Excel (terapkan filter yang sama)
     cols = [
         "Tanggal Invoice","Nomer Invoice","Kode Booking","Nomor Tiket",
         "Nominal Invoice","Tanggal Pembayaran Invoice",
@@ -346,9 +328,6 @@ if st.button("🚀 Proses"):
         "Channel","Merchant","Selisih","Kategori",
     ]
     xlsx = build_xlsx(cols, rows, sheet_name="Rekonsiliasi")
-    st.download_button(
-        "⬇️ Download Excel (.xlsx)",
-        data=xlsx,
-        file_name="rekonsiliasi_preview_10_split.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx,
+                       file_name=("rekonsiliasi_ultralite_selisih.xlsx" if only_diff else "rekonsiliasi_ultralite.xlsx"),
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
