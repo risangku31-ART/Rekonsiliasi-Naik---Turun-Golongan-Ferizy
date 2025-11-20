@@ -1,18 +1,7 @@
 # =========================
-# file: .streamlit/config.toml
-# =========================
-# Paste ke file ini untuk mengatur batas upload secara resmi (tanpa error)
-# Buat folder `.streamlit` di root, lalu simpan sebagai `config.toml`
-
-# [server]
-# maxUploadSize = 2048   # dalam MB
-# maxMessageSize = 512   # opsional
-
-
-# =========================
 # file: app.py
 # =========================
-# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — ringkas + preview + fix upload size
+# Rekonsiliasi Naik/Turun Golongan (.xlsb only) — Nomor Invoice DIAMBIL TEPAT dari kolom "Nomor Invoice" (Invoice)
 # Requirements minimal:
 #   streamlit>=1.26
 #   pyxlsb>=1.0.10
@@ -24,16 +13,17 @@ from typing import Dict, List, Optional
 import streamlit as st
 
 # ---------- Page ----------
-st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Ringkas + Preview", layout="wide")
-# NOTE: set upload limit sebaiknya via .streamlit/config.toml; wrapper di bawah hanya agar tidak crash
+st.set_page_config(page_title="Rekonsiliasi (.xlsb) — Nomor Invoice EXACT", layout="wide")
+
 def _try_set_max_upload(mb: int) -> None:
+    # Why: beberapa env tidak mengizinkan set_option server.* saat runtime
     try:
-        st.set_option("server.maxUploadSize", int(mb))  # bisa ditolak di runtime -> diamkan jika gagal
+        st.set_option("server.maxUploadSize", int(mb))
     except Exception:
         pass
 _try_set_max_upload(2048)
 
-st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) Ringkas + Preview")
+st.title("🔄 Rekonsiliasi Naik/Turun Golongan — (.xlsb) | Nomor Invoice dari kolom 'Nomor Invoice' (Invoice)")
 st.markdown("""
 <style>
 div[data-testid="stMetricLabel"]{font-size:11px!important}
@@ -95,6 +85,13 @@ def pick_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
             if h == c or c in h: return i
     return None
 
+def find_exact_idx(headers: List[str], exact_name: str) -> Optional[int]:
+    target = norm(exact_name)
+    for i, h in enumerate(headers):
+        if norm(h) == target:
+            return i
+    return None
+
 # ---------- XLSX Writer (export tanpa dependency lain) ----------
 def _letters(idx: int) -> str:
     s=""; idx+=1
@@ -151,7 +148,7 @@ def build_xlsx(columns: List[str], rows: List[Dict[str, str]], sheet_name="Rekon
 
 # ---------- Pembaca .xlsb (cepat, auto-header) ----------
 def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False):
-    """Yield dict per-baris; auto header; default hanya sheet ke-1. Why: lebih cepat."""
+    """Yield dict per-baris; auto header; default hanya sheet ke-1. (Why: kinerja)."""
     import pyxlsb  # wajib untuk .xlsb
     file.seek(0); b = file.read()
     with tempfile.NamedTemporaryFile(delete=True, suffix=".xlsb") as tmp:
@@ -167,13 +164,13 @@ def iter_records_xlsb(file, sheet_index: int = 1, scan_all_sheets: bool = False)
                         if header is None:
                             nonempty = [v for v in vals if v.strip()]
                             nums = sum(1 for v in nonempty if numeric_like(v))
-                            header = nonempty if nums <= len(nonempty)//2 else vals  # hindari baris numeric sebagai header
+                            header = nonempty if nums <= len(nonempty)//2 else vals
                             header = [h.strip() or f"COL{j+1}" for j,h in enumerate(header)]
                             continue
                         vals = vals + [""] * (len(header) - len(vals))
                         yield {header[i]: vals[i] for i in range(len(header))}
             if scan_all_sheets:
-                for i in range(1, 7):  # batasi agar tetap cepat
+                for i in range(1, 7):
                     try:
                         yielded = False
                         for rec in read_sheet(i):
@@ -210,6 +207,7 @@ if st.button("🚀 Proses"):
     order: List[str] = []; seen = set()
 
     inv_first = {"tgl_inv": {}, "pay_inv": {}, "tujuan": {}, "channel": {}, "merchant": {}}
+    inv_original: Dict[str, str] = {}  # simpan nilai Nomor Invoice asli (WHY: tampilkan apa adanya)
     ts_first  = {"pay_ts": {}}
     ts_join   = {"kode": {}, "tiket": {}, "gol": {}, "asal": {}, "cetak": {}}
 
@@ -217,8 +215,7 @@ if st.button("🚀 Proses"):
         if not v: return
         store.setdefault(k, set()).add(v)
 
-    # Kandidat kolom
-    C_INV_KEY = ["nomor invoice","no invoice","invoice"]
+    # Kandidat lain (untuk kolom non-kunci)
     C_INV_AMT = ["harga","nominal","amount","total","nilai"]
     C_INV_TGL = ["tanggal invoice","tgl invoice","tanggal","tgl"]
     C_INV_PAY = ["pembayaran","tgl pembayaran","tanggal pembayaran"]
@@ -226,7 +223,7 @@ if st.button("🚀 Proses"):
     C_INV_CH  = ["channel"]
     C_INV_MER = ["merchant","mid"]
 
-    C_TS_KEY  = ["nomor invoice","no invoice","invoice"]
+    C_TS_KEY  = ["nomor invoice","no invoice","invoice"]  # tetap fleksibel di T-Summary
     C_TS_AMT  = ["tarif","harga","nominal","amount","total","nilai"]
     C_TS_KODE = ["kode booking","kode boking","booking"]
     C_TS_TKT  = ["nomor tiket","no tiket","ticket"]
@@ -235,31 +232,35 @@ if st.button("🚀 Proses"):
     C_TS_ASAL = ["asal","keberangkatan"]
     C_TS_CTK  = ["cetak boarding pass","tgl cetak"]
 
-    def first_idx(hdr: List[str], cands: List[str]) -> Optional[int]:
-        return pick_col_idx(hdr, cands)
-
     # --- Invoice ---
     for f in inv_files:
         key_idx = amt_idx = tgl_idx = pay_idx = tuj_idx = ch_idx = mer_idx = None
         for row in iter_records_xlsb(f, sheet_index=sheet_idx, scan_all_sheets=scan_all):
             if key_idx is None:
                 hdr = list(row.keys())
-                key_idx = first_idx(hdr, C_INV_KEY)
-                amt_idx = first_idx(hdr, C_INV_AMT)
-                tgl_idx = first_idx(hdr, C_INV_TGL)
-                pay_idx = first_idx(hdr, C_INV_PAY)
-                tuj_idx = first_idx(hdr, C_INV_TUJ)
-                ch_idx  = first_idx(hdr, C_INV_CH)
-                mer_idx = first_idx(hdr, C_INV_MER)
-                if key_idx is None or amt_idx is None:
-                    st.error(f"Header tidak lengkap di file Invoice: {f.name}")
-                    break
+                # >>> WAJIB: kolom tepat "Nomor Invoice" (case-insensitive)
+                key_idx = find_exact_idx(hdr, "nomor invoice")
+                if key_idx is None:
+                    st.error(f"File Invoice **{f.name}** tidak memiliki header persis **'Nomor Invoice'**. "
+                             f"Ubah header agar tepat 'Nomor Invoice'.")
+                    st.stop()
+                amt_idx = pick_col_idx(hdr, C_INV_AMT)
+                tgl_idx = pick_col_idx(hdr, C_INV_TGL)
+                pay_idx = pick_col_idx(hdr, C_INV_PAY)
+                tuj_idx = pick_col_idx(hdr, C_INV_TUJ)
+                ch_idx  = pick_col_idx(hdr, C_INV_CH)
+                mer_idx = pick_col_idx(hdr, C_INV_MER)
+                if amt_idx is None:
+                    st.error(f"File Invoice **{f.name}** tidak memiliki kolom Nominal/Harga yang dikenali.")
+                    st.stop()
             vals = list(row.values())
-            key = coerce_key(vals[key_idx])
+            inv_no_raw = vals[key_idx]  # tampilkan apa adanya
+            key = coerce_key(inv_no_raw)  # hanya untuk kunci agregasi
             if not key: continue
             if key not in seen: seen.add(key); order.append(key)
-            agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(vals[amt_idx])
+            if key not in inv_original: inv_original[key] = inv_no_raw
 
+            agg_inv[key] = agg_inv.get(key, 0.0) + parse_money(vals[amt_idx])
             if key not in inv_first["tgl_inv"] and tgl_idx is not None and vals[tgl_idx]: inv_first["tgl_inv"][key] = vals[tgl_idx]
             if key not in inv_first["pay_inv"] and pay_idx is not None and vals[pay_idx]: inv_first["pay_inv"][key] = vals[pay_idx]
             if key not in inv_first["tujuan"]  and tuj_idx is not None and vals[tuj_idx]: inv_first["tujuan"][key]  = vals[tuj_idx]
@@ -272,19 +273,19 @@ if st.button("🚀 Proses"):
         for row in iter_records_xlsb(f, sheet_index=sheet_idx, scan_all_sheets=scan_all):
             if key_idx is None:
                 hdr = list(row.keys())
-                key_idx  = first_idx(hdr, C_TS_KEY)
-                amt_idx  = first_idx(hdr, C_TS_AMT)
-                kode_idx = first_idx(hdr, C_TS_KODE)
-                tkt_idx  = first_idx(hdr, C_TS_TKT)
-                pay_idx  = first_idx(hdr, C_TS_PAY)
-                gol_idx  = first_idx(hdr, C_TS_GOL)
-                asal_idx = first_idx(hdr, C_TS_ASAL)
-                ctk_idx  = first_idx(hdr, C_TS_CTK)
+                key_idx  = pick_col_idx(hdr, C_TS_KEY)   # fleksibel
+                amt_idx  = pick_col_idx(hdr, C_TS_AMT)
+                kode_idx = pick_col_idx(hdr, C_TS_KODE)
+                tkt_idx  = pick_col_idx(hdr, C_TS_TKT)
+                pay_idx  = pick_col_idx(hdr, C_TS_PAY)
+                gol_idx  = pick_col_idx(hdr, C_TS_GOL)
+                asal_idx = pick_col_idx(hdr, C_TS_ASAL)
+                ctk_idx  = pick_col_idx(hdr, C_TS_CTK)
                 if key_idx is None or amt_idx is None:
-                    st.error(f"Header tidak lengkap di file T-Summary: {f.name}")
-                    break
+                    st.error(f"File T-Summary **{f.name}** tidak memiliki kolom kunci/Nominal yang dikenali.")
+                    st.stop()
             vals = list(row.values())
-            key = coerce_key(vals[key_idx])
+            key = coerce_key(vals[key_idx])  # harus match dengan kunci Invoice (dinormalisasi)
             if not key: continue
             agg_ts[key] = agg_ts.get(key, 0.0) + parse_money(vals[amt_idx])
             if key not in ts_first["pay_ts"] and pay_idx is not None and vals[pay_idx]: ts_first["pay_ts"][key] = vals[pay_idx]
@@ -308,7 +309,7 @@ if st.button("🚀 Proses"):
         cat = "Turun" if v_inv > v_ts else ("Naik" if v_inv < v_ts else "Sama")
         rows.append({
             "Tanggal Invoice":              inv_first["tgl_inv"].get(k, ""),
-            "Nomor Invoice":                k,
+            "Nomor Invoice":                inv_original.get(k, k),  # tampilkan sesuai file Invoice
             "Kode Booking":                 ", ".join(sorted(ts_join["kode"].get(k, set()))),
             "Nomor Tiket":                  ", ".join(sorted(ts_join["tiket"].get(k, set()))),
             "Invoice (Nominal; Tgl Bayar)": f"{format_idr(v_inv)}; {inv_first['pay_inv'].get(k, '')}",
@@ -347,6 +348,6 @@ if st.button("🚀 Proses"):
     st.download_button(
         "⬇️ Download Excel (.xlsx)",
         data=xlsx,
-        file_name="rekonsiliasi_preview.xlsx",
+        file_name="rekonsiliasi_invoice_exact.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
